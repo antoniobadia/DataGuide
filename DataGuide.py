@@ -143,7 +143,7 @@ class DataGuide:
             self.total_docs += 1
             self._insert_value(self.root, doc)
 
-    def _insert_value(self, node, value):
+    def _insert_value(self, node, value): # Here value can be an entire document, a nested sub-object , a list, or a primitive value input through recursion
         """
         Helper method to insert a single value, called recursively on objects and arrays
         """
@@ -152,7 +152,7 @@ class DataGuide:
             #Increment object counter
             node.update_counter("obj")
             #Iterate over keys and subvalues contained in object
-            for key, subvalue in value.items():
+            for key, subvalue in value.items(): # value.items() breaks down the value into its key pairs, such as 'a':1 , 'b': {'c':'foo'} etc.
                 #Add key if not already present
                 if key not in node.children:
                     node.children[key] = Node()
@@ -497,6 +497,46 @@ class DataGuide:
             copy.children[key] = self._clone_subtree(child)
         return copy
     
+    def project(self, paths):
+        """
+        Return a new DataGuide with only the specified (possibly nested) paths.
+        Includes parent nodes as needed. Updates total_docs to reflect the
+        minimum number of documents that could contain all projected paths.
+        """
+        new_guide = DataGuide()
+        min_counts = []
+
+        for path in paths:
+            #Check if full path exists
+            source_leaf = self._traverse_path(path)
+            if source_leaf is None:
+                #Skip nonexistent paths
+                continue  
+            #Track the total count for this path
+            min_counts.append(sum(source_leaf.counters.values()))
+
+            #Traverse parts of the path
+            parts = path.split(".")
+            source_node = self.root
+            target_node = new_guide.root
+
+            for part in parts:
+                if part not in source_node.children:
+                    break
+
+                if part not in target_node.children:
+                    target_node.children[part] = Node()
+
+                source_node = source_node.children[part]
+                target_node = target_node.children[part]
+
+                # Copy counters at every level
+                target_node.counters = source_node.counters.copy()
+
+        #Set conservative document count
+        new_guide.total_docs = min(min_counts) if min_counts else 0
+        return new_guide
+
     def intersect(self, other):
         """
         Method to intersect two dataguides, as if an intersection was performed on original JSON documents
