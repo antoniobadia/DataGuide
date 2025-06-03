@@ -530,12 +530,14 @@ class DataGuide:
                 source_node = source_node.children[part]
                 target_node = target_node.children[part]
 
-                # Copy counters at every level
+                #Copy counters at every level
                 target_node.counters = source_node.counters.copy()
 
-        #Set conservative document count
-        new_guide.total_docs = min(min_counts) if min_counts else 0
+        #Conservative max total docs that might have any of the paths
+        sum_counts = sum(min_counts)
+        new_guide.total_docs = min(self.total_docs, sum_counts)
         return new_guide
+
 
     def intersect(self, other):
         """
