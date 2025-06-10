@@ -503,42 +503,71 @@ class DataGuide:
         Includes parent nodes as needed. Updates total_docs to reflect the
         minimum number of documents that could contain all projected paths.
         """
+        #Create a new DataGuide object. This will be the result of the projection. The return
         new_guide = DataGuide()
+        
+        #Initialize an empty list to store the sum of counts for each specified path
+        #This will be used later to determine the total_docs for the new guide
         min_counts = []
 
+        #Iterate through each path provided in the 'paths' list
         for path in paths:
-            #Check if full path exists
+            #Attempt to traverse the current path in the original DataGuide(self)
+            #This returns the leaf Node object if the path exists, otherwise None
             source_leaf = self._traverse_path(path)
+            
+            #If the path does not exist skip it and move to the next path
             if source_leaf is None:
-                #Skip nonexistent paths
                 continue  
-            #Track the total count for this path
+            
+            #Sum all counter values (int, str, etc.) for the 'source_leaf' node
+            #This sum represents the total number of times this specific path was encountered across all documents,
+            #This value is appended to the 'min_counts' list
             min_counts.append(sum(source_leaf.counters.values()))
 
-            #Traverse parts of the path
+            #Split the current path string into its individual segments (example, "root.b.c" becomes ["root", "b", "c"]).
             parts = path.split(".")
+            
+            #Initialize 'source_node' to the root of the original DataGuide.
             source_node = self.root
+            
+            #Initialize 'target_node' to the root of the 'new_guide' (the projected DataGuide).
             target_node = new_guide.root
 
+            #Iterate through each segment (part) of the current path.
             for part in parts:
+                #Check if the current 'part' exists as a child in the 'source_node' of the original DataGuide.
                 if part not in source_node.children:
+                    #If it doesn't exist, it means the path was incomplete or incorrect
                     break
 
+                #If the current 'part' does not exist as a child in the 'target_node' of the new DataGuide,
+                #Create a new Node for it. This ensures parent nodes are included in the projection
                 if part not in target_node.children:
                     target_node.children[part] = Node()
 
+                #Move 'source_node' down to its child corresponding to 'part'
                 source_node = source_node.children[part]
+                
+                #Move 'target_node' down to its newly created or existing child corresponding to 'part'
                 target_node = target_node.children[part]
 
-                #Copy counters at every level
+                #Copy the counters from the 'source_node' (from the original DataGuide),
+                #To the 'target_node' (in the new projected DataGuide)
+                #This ensures that intermediate nodes in the projected path also have their correct counts
                 target_node.counters = source_node.counters.copy()
 
-        #Conservative max total docs that might have any of the paths
+        #Calculate the sum of all counts collected for the specified paths
         sum_counts = sum(min_counts)
+        
+        #Set the 'total_docs' for the new projected DataGuide
+        #It's set to the minimum of the original DataGuide's total_docs and the calculated sum_counts
+        #This estimates the minimum number of documents that would contain all the projected paths
         new_guide.total_docs = min(self.total_docs, sum_counts)
+        
+        #Return the newly created DataGuide
         return new_guide
-
-
+        
     def intersect(self, other):
         """
         Method to intersect two dataguides, as if an intersection was performed on original JSON documents
