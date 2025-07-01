@@ -505,6 +505,40 @@ class DataGuidePath:
                 total[key] = total.get(key, 0) + value
         return total
     
+    def nest(self, fuzzy_key_objs_list):
+        """
+        Returns a new DataGuidePath object containing only the leaf paths
+        from the original guide that contain ANY of the given fuzzy_key_objs
+        as a sub-path.
+        
+        Args:
+            fuzzy_key_objs_list (list of Path): A list of Path objects to search for.
+
+        Returns:
+            DataGuidePath: A new DataGuidePath object with only the matching paths.
+        """
+        if not isinstance(fuzzy_key_objs_list, list):
+            raise TypeError("fuzzy_key_objs_list must be a list of Path objects.")
+        for key_obj in fuzzy_key_objs_list:
+            if not isinstance(key_obj, Path):
+                raise TypeError("All items in fuzzy_key_objs_list must be Path objects.")
+
+        all_original_leaf_paths = self._gather_paths(self.root)
+        
+        paths_to_project = []
+        for leaf_path_obj in all_original_leaf_paths:
+            should_include_leaf = False
+            for fuzzy_key_to_match in fuzzy_key_objs_list: # Iterate through the list of fuzzy keys
+                if self._path_contains_subpath(leaf_path_obj, fuzzy_key_to_match): # Check if it contains ANY of them
+                    should_include_leaf = True
+                    break # Found a match for this leaf path, no need to check other fuzzy keys
+            
+            if should_include_leaf:
+                paths_to_project.append(leaf_path_obj)
+                
+        return self.project(paths_to_project)
+
+
     def union(self, other):
         """
         Method used to union two dataguides, other is a second dataguide
@@ -972,10 +1006,134 @@ class DataGuidePath:
         
         return result  
     
-    def nest_by_grouping_keys(self, grouping_keys, new_nested_key_name, include_partial_or_null=False):
+    def nest_by_grouping_keys(self, grouping_keys, new_path_for_others):
         """
+        Groups documents by 'grouping_keys' (kept at their original level)
+        and moves 'all other attributes' into a new array path.
+        
+        Args:
+            grouping_keys (list of str or Path): A list of paths (or string representations of paths) to keep at the top level.
+            new_path_for_others (str): The name of the new path where all other attributes will be collected into an array. (e.g., 'e').
+
+        Returns:
+            tuple: A tuple containing:
+                - DataGuidePath: A new DataGuidePath object with the transformed schema.
+                - (temporary) dict: A report on grouping key presence, including estimations for impacted documents. 
+        """
+        if not grouping_keys:
+            raise ValueError("grouping_keys cannot be empty.")
+        if not new_path_for_others:
+            raise ValueError("new_path_for_others cannot be empty.")
+
+        # Convert grouping_keys to Path objects for consistency
+        grouping_key_paths = []
+        for key in grouping_keys:
+            if isinstance(key, str):
+                grouping_key_paths.append(Path(key))
+            elif isinstance(key, Path):
+                grouping_key_paths.append(key)
+            else:
+                raise TypeError("Each grouping key must be a string or a Path object.")
+
+        transformed_path_node_map = {}
+        all_original_leaf_paths = self._gather_paths(self.root)
+        
+        # Identify top-level segments of grouping keys for quick check
+        top_level_grouping_segments = {gp.get_parts()[0] for gp in grouping_key_paths if gp.get_parts()}
+
+        for original_path_obj in all_original_leaf_paths:
+            source_node = self._traverse_path(original_path_obj)
+            if source_node is None: continue 
+
+            original_top_level_segment = original_path_obj.get_parts()[0] if original_path_obj.get_parts() else None
+            
+            # Case 1: Path is part of a grouping key's subtree. Keep it at its original level.
+            is_part_of_kept_group = False
+            for gp_obj in grouping_key_paths:
+                if original_path_obj.starts_with(gp_obj):
+                    transformed_path_node_map[original_path_obj] = source_node
+                    is_part_of_kept_group = True
+                    break
+            
+            if not is_part_of_kept_group and original_top_level_segment:
+                # Case 2: This path is NOT part of a grouping key's direct subtree,
+                # AND its top-level segment is NOT one of the grouping keys.
+                # So, it's an "other attribute" that needs to be nested under new_path_for_others.*
+                # Example: 'a' -> 'e.*.a', 'f.*' -> 'e.*.f.*'
+                
+                # Check if this original_path_obj's top-level segment is NOT in the grouping keys.
+                # This ensures we only move "other" top-level attributes.
+                if original_top_level_segment not in top_level_grouping_segments:
+                    transformed_path = Path(new_path_for_others).append('*')
+                    # Append the entire original path after the '*'
+                    for part in original_path_obj.get_parts(): 
+                        transformed_path = transformed_path.append(part)
+                    transformed_path_node_map[transformed_path] = source_node
+                # else: If original_top_level_segment IS in top_level_grouping_segments but original_path_obj
+                #       did not start with any gp_obj (meaning it's a sub-path like root.X.Y but X is a grouping key
+                #       but this path is not under that specific X branch), then it is effectively discarded in this variant.
+
+        new_guide = self._rebuild_guide_from_path_node_map(transformed_path_node_map)
+        new_guide.total_docs = self.total_docs
+        
+        # --- Report Generation ---
+        max_impacted_documents_estimate = self.total_docs # Still all documents
+
+        # Needs work here for min docs
+        min_kept_grouping_keys_present_estimate = 0
+        if grouping_key_paths:
+            kept_key_total_docs_estimates = []
+            for gp_obj in grouping_key_paths:
+                kept_key_total_docs_estimates.append(
+                    self._estimate_docs_containing_any_fuzzy_key_occurrence(gp_obj) # Using fuzzy occurrence for kept keys
+                )
+            if kept_key_total_docs_estimates:
+                min_kept_grouping_keys_present_estimate = min(kept_key_total_docs_estimates)
+
+        # Also needs work, Count of documents having any 'other' attribute that was moved
+        estimated_docs_with_other_attributes_moved = 0
+        other_attributes_paths_for_report = set()
+        for original_path_obj in all_original_leaf_paths:
+            original_top_level_segment = original_path_obj.get_parts()[0] if original_path_obj.get_parts() else None
+            is_part_of_kept_group = False
+            for gp_obj in grouping_key_paths:
+                if original_path_obj.starts_with(gp_obj):
+                    is_part_of_kept_group = True
+                    break
+            if not is_part_of_kept_group and original_top_level_segment and original_top_level_segment not in top_level_grouping_segments:
+                other_attributes_paths_for_report.add(Path(original_top_level_segment)) # Add top-level non-grouped segments
+        
+        if other_attributes_paths_for_report:
+            union_of_other_attributes_guide = DataGuidePath()
+            for path_obj in other_attributes_paths_for_report:
+                proj_guide = self.project([path_obj])
+                union_of_other_attributes_guide = union_of_other_attributes_guide.union(proj_guide)
+            estimated_docs_with_other_attributes_moved = union_of_other_attributes_guide.total_docs
+
+
+        report = {
+            "total_documents_in_guide": self.total_docs,
+            "max_impacted_documents_estimate": max_impacted_documents_estimate,
+            "min_kept_grouping_keys_present_estimate": min_kept_grouping_keys_present_estimate,
+            "estimated_docs_with_other_attributes_moved": estimated_docs_with_other_attributes_moved,
+            "grouping_key_presence_counts": {}, # Exact path presence count for input grouping keys
+        }
+
+        for gp_obj in grouping_key_paths:
+            node = self._traverse_path(gp_obj)
+            if node:
+                report["grouping_key_presence_counts"][str(gp_obj)] = sum(node.counters.values())
+            else:
+                report["grouping_key_presence_counts"][str(gp_obj)] = 0
+        
+        return new_guide, report
+
+    def _nest_matched_paths_and_filter_others(self, grouping_keys, new_nested_key_name, include_partial_or_null=False):
+        """
+        (Variant 1 of Group/Nest)
         Nests paths based on the presence of a set of 'grouping_keys' under a 'new_nested_key_name'.
         A path is considered for nesting if any part of its full path contains a grouping key.
+        Everything else is either discarded (if include_partial_or_null=False) or moved to a partial/null bucket.
         
         Args:
             grouping_keys (list of str or Path): A list of paths (or string representations of paths)
@@ -989,24 +1147,13 @@ class DataGuidePath:
         Returns:
             tuple: A tuple containing:
                 - DataGuidePath: A new DataGuidePath object with the transformed schema.
-                - dict: A report on grouping key presence, including estimations for impacted documents:
-                    {
-                        "total_documents_in_guide": int,
-                        "max_impacted_documents_estimate": int, # All documents in the guide
-                        "min_exact_grouping_keys_present_estimate": int, # Documents containing all specified grouping keys (at their exact paths)
-                        "estimated_documents_with_primary_and_fuzzy_subpath": int, # (Only if 2 grouping keys provided) Estimates docs with 1st key AND (any path containing 2nd key)
-                        "grouping_key_presence_counts": { # How many times each exact grouping key path appears in the guide (from root)
-                            "path_str": int,
-                            ...
-                        }
-                    }
+                - dict: A report on grouping key presence, including estimations for impacted documents.
         """
         if not grouping_keys:
             raise ValueError("grouping_keys cannot be empty.")
         if not new_nested_key_name:
             raise ValueError("new_nested_key_name cannot be empty.")
 
-        # Convert grouping_keys to Path objects for consistency
         grouping_key_paths = []
         for key in grouping_keys:
             if isinstance(key, str):
@@ -1023,66 +1170,45 @@ class DataGuidePath:
             source_node = self._traverse_path(original_path_obj)
             if source_node is None: continue 
 
-            should_nest_this_path = False
+            is_matched_for_nesting = False
             for gp_obj in grouping_key_paths:
-                # Helper function to check if the grouping key is contained anywhere in the path
                 if self._path_contains_subpath(original_path_obj, gp_obj):
-                    should_nest_this_path = True
+                    is_matched_for_nesting = True
                     break
             
-            transformed_path_obj = None
-            if should_nest_this_path:
-                # The entire original_path_obj is moved under new_nested_key_name
+            if is_matched_for_nesting:
                 transformed_path = Path(new_nested_key_name)
                 for part in original_path_obj.get_parts():
                     transformed_path = transformed_path.append(part)
-                transformed_path_obj = transformed_path
-            else:
-                if include_partial_or_null:
-                    transformed_path = Path("_partial_or_null_group")
-                    for part in original_path_obj.get_parts():
-                        transformed_path = transformed_path.append(part)
-                    transformed_path_obj = transformed_path
-                else:
-                    transformed_path_obj = original_path_obj
-            
-            if transformed_path_obj:
-                transformed_path_node_map[transformed_path_obj] = source_node
-
+                transformed_path_node_map[transformed_path] = source_node
+            elif include_partial_or_null:
+                transformed_path = Path("_partial_or_null_group")
+                for part in original_path_obj.get_parts():
+                    transformed_path = transformed_path.append(part)
+                transformed_path_node_map[transformed_path] = source_node
+            # else: paths not matched and not for partial/null are implicitly discarded
+        
         new_guide = self._rebuild_guide_from_path_node_map(transformed_path_node_map)
         new_guide.total_docs = self.total_docs
 
         # --- Report Generation ---
         max_impacted_documents_estimate = self.total_docs
-
-        # Metric for documents with ALL exact grouping keys
-        min_exact_grouping_keys_present_estimate = 0 
+        min_fuzzy_grouping_keys_present_estimate = 0
         if grouping_key_paths:
-            projected_total_docs_list = []
+            fuzzy_key_total_docs_estimates = []
             for gp_obj in grouping_key_paths:
-                proj_guide = self.project([gp_obj])
-                projected_total_docs_list.append(proj_guide.total_docs)
-            
-            if projected_total_docs_list:
-                min_exact_grouping_keys_present_estimate = min(projected_total_docs_list)
+                fuzzy_key_total_docs_estimates.append(
+                    self._estimate_docs_containing_any_fuzzy_key_occurrence(gp_obj)
+                )
+            if fuzzy_key_total_docs_estimates:
+                min_fuzzy_grouping_keys_present_estimate = min(fuzzy_key_total_docs_estimates)
         
-        # Estimated documents with primary_key AND (any path containing fuzzy_subpath_obj)
-        estimated_documents_with_primary_and_fuzzy_subpath = None
-        if len(grouping_key_paths) == 2: # This metric applies specifically to 2 grouping keys
-            primary_key = grouping_key_paths[0]
-            fuzzy_subpath = grouping_key_paths[1]
-            estimated_documents_with_primary_and_fuzzy_subpath = self._estimate_documents_with_subpath_intersection_union(primary_key, fuzzy_subpath)
-
         report = {
             "total_documents_in_guide": self.total_docs,
             "max_impacted_documents_estimate": max_impacted_documents_estimate,
-            "min_exact_grouping_keys_present_estimate": min_exact_grouping_keys_present_estimate,
-            "grouping_key_presence_counts": {}, # Exact path presence count
+            "min_fuzzy_grouping_keys_present_estimate": min_fuzzy_grouping_keys_present_estimate,
+            "grouping_key_presence_counts": {},
         }
-
-        # Add the new complex metric to the report if it was calculated
-        if estimated_documents_with_primary_and_fuzzy_subpath is not None:
-            report["estimated_documents_with_primary_and_fuzzy_subpath"] = estimated_documents_with_primary_and_fuzzy_subpath
         
         for gp_obj in grouping_key_paths:
             node = self._traverse_path(gp_obj)
@@ -1130,6 +1256,45 @@ class DataGuidePath:
             
         return estimated_union_total_docs
     
+    def _get_intuitive_intersection_docs_count(self, guide1, guide2):
+        """
+        Helper to provide a more intuitive document intersection count for potentially disjoint schema paths.
+        It estimates the intersection as the minimum of the total_docs of the two guides.
+        This is a heuristic when precise overlap cannot be determined from schema alone.
+        """
+        # This estimate is based on the principle that the number of documents containing both sets of paths
+        # cannot exceed the number of documents in the smaller of the two guides (assuming projection correctly sets total_docs).
+        return min(guide1.total_docs, guide2.total_docs)
+
+    def _estimate_docs_containing_any_fuzzy_key_occurrence(self, fuzzy_key_obj):
+        """
+        Estimates the total number of documents that contain at least one occurrence
+        of the given fuzzy_key_obj (sub-path) anywhere within their full paths.
+        This is done by projecting on all actual leaf paths that contain the fuzzy_key_obj
+        and then taking the union of those projections' total_docs.
+        """
+        if not isinstance(fuzzy_key_obj, Path):
+            raise TypeError("fuzzy_key_obj must be a Path object.")
+
+        all_original_leaf_paths = self._gather_paths(self.root)
+        
+        # Collect the *unique top-level segments* of all actual leaf paths that contain the fuzzy_key_obj.
+        # This is the most reliable way to count unique documents without document IDs.
+        unique_top_level_segments_matched = set()
+        for leaf_path_obj in all_original_leaf_paths:
+            if self._path_contains_subpath(leaf_path_obj, fuzzy_key_obj):
+                if leaf_path_obj.get_parts():
+                    unique_top_level_segments_matched.add(Path(leaf_path_obj.get_parts()[0]))
+
+        # Now, project on these unique top-level segments and union them.
+        # This union's total_docs should represent the count of unique documents.
+        union_of_projections_from_top_levels = DataGuidePath()
+        for top_level_path_obj in unique_top_level_segments_matched:
+            # Projecting on a top-level path should give total_docs for documents with that top-level path.
+            proj_guide = self.project([top_level_path_obj])
+            union_of_projections_from_top_levels = union_of_projections_from_top_levels.union(proj_guide)
+            
+        return union_of_projections_from_top_levels.total_docs
     def _get_intuitive_intersection_docs_count(self, guide1, guide2):
         """
         Helper to provide a more intuitive document intersection count for potentially disjoint schema paths.
