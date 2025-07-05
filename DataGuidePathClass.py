@@ -505,40 +505,143 @@ class DataGuidePath:
                 total[key] = total.get(key, 0) + value
         return total
     
-    def nest(self, fuzzy_key_objs_list):
-        """
-        Returns a new DataGuidePath object containing only the leaf paths
-        from the original guide that contain ANY of the given fuzzy_key_objs
-        as a sub-path.
+    # def nest(self, fuzzy_key_objs_list):
+    #     """
+    #     Returns a new DataGuidePath object containing only the leaf paths
+    #     from the original guide that contain ANY of the given fuzzy_key_objs
+    #     as a sub-path.
         
+    #     Args:
+    #         fuzzy_key_objs_list (list of Path): A list of Path objects to search for.
+
+    #     Returns:
+    #         DataGuidePath: A new DataGuidePath object with only the matching paths.
+    #     """
+    #     if not isinstance(fuzzy_key_objs_list, list):
+    #         raise TypeError("fuzzy_key_objs_list must be a list of Path objects.")
+    #     for key_obj in fuzzy_key_objs_list:
+    #         if not isinstance(key_obj, Path):
+    #             raise TypeError("All items in fuzzy_key_objs_list must be Path objects.")
+
+    #     all_original_leaf_paths = self._gather_paths(self.root)
+        
+    #     paths_to_project = []
+    #     for leaf_path_obj in all_original_leaf_paths:
+    #         should_include_leaf = False
+    #         for fuzzy_key_to_match in fuzzy_key_objs_list: # Iterate through the list of fuzzy keys
+    #             if self._path_contains_subpath(leaf_path_obj, fuzzy_key_to_match): # Check if it contains ANY of them
+    #                 should_include_leaf = True
+    #                 break # Found a match for this leaf path, no need to check other fuzzy keys
+            
+    #         if should_include_leaf:
+    #             paths_to_project.append(leaf_path_obj)
+                
+    #     return self.project(paths_to_project)
+
+    # for new testing
+    def nest(self, paths_to_project, new_root_key=None):
+        """
+        Returns a new DataGuidePath object containing only the specified paths.
+        These paths can be provided as a list of Path objects or strings.
+        If new_root_key is provided, all projected paths will be nested under this new key.
+
         Args:
-            fuzzy_key_objs_list (list of Path): A list of Path objects to search for.
+            paths_to_project (list of Path or str): A list of Path objects or string representations of paths to project.
+            new_root_key (str, optional): If provided, all projected paths will be nested
+                                          under this new key at the root level.
 
         Returns:
             DataGuidePath: A new DataGuidePath object with only the matching paths.
         """
-        if not isinstance(fuzzy_key_objs_list, list):
-            raise TypeError("fuzzy_key_objs_list must be a list of Path objects.")
-        for key_obj in fuzzy_key_objs_list:
-            if not isinstance(key_obj, Path):
-                raise TypeError("All items in fuzzy_key_objs_list must be Path objects.")
+        processed_paths = []
+        for p_input in paths_to_project:
+            if isinstance(p_input, str):
+                processed_paths.append(Path(p_input))
+            elif isinstance(p_input, Path):
+                processed_paths.append(p_input)
+            else:
+                raise TypeError("All items in paths_to_project must be Path objects or strings.")
 
-        all_original_leaf_paths = self._gather_paths(self.root)
+        path_node_map = {}
+        # We need to gather all *leaf* paths that are descendants of the paths_to_project
+        # and then transform them if new_root_key is provided.
         
-        paths_to_project = []
-        for leaf_path_obj in all_original_leaf_paths:
-            should_include_leaf = False
-            for fuzzy_key_to_match in fuzzy_key_objs_list: # Iterate through the list of fuzzy keys
-                if self._path_contains_subpath(leaf_path_obj, fuzzy_key_to_match): # Check if it contains ANY of them
-                    should_include_leaf = True
-                    break # Found a match for this leaf path, no need to check other fuzzy keys
+        all_original_leaf_paths = self._gather_paths(self.root)
+
+        for original_leaf_path_obj in all_original_leaf_paths:
+            source_node = self._traverse_path(original_leaf_path_obj)
+            if source_node is None: continue # Should not happen if _gather_paths is correct
+
+            # Check if this leaf path is a descendant of any of the paths_to_project
+            should_include = False
+            for project_path_obj in processed_paths:
+                if original_leaf_path_obj.starts_with(project_path_obj):
+                    should_include = True
+                    break
             
-            if should_include_leaf:
-                paths_to_project.append(leaf_path_obj)
+            if should_include:
+                transformed_path_obj = original_leaf_path_obj
+                if new_root_key:
+                    # If new_root_key is present, prepend it to the original path parts.
+                    # Example: original path 'a.b.c', new_root_key 'X' -> 'X.a.b.c'
+                    new_path_parts = [new_root_key] + original_leaf_path_obj.get_parts()
+                    transformed_path_obj = Path(".".join(new_path_parts))
                 
-        return self.project(paths_to_project)
+                path_node_map[transformed_path_obj] = source_node
+        
+        new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
+        new_guide.total_docs = self.total_docs
+        return new_guide
+    
+    #for new testing
+    def nest_schema(self, paths_config, new_root_key=None, new_path_for_others=None):
+        """
+        A unified method to perform schema nesting based on the input configuration.
 
+        Args:
+            paths_config (list of Path or str):
+                If `new_path_for_others` is NOT provided: Projects only the specified paths.
+                                                          Equivalent to calling `self.nest(paths_config, new_root_key=new_root_key)`.
+                If `new_path_for_others` IS provided: Groups documents by the paths in `paths_config` (kept at their original level)
+                                                      and moves 'all other attributes' into the `new_path_for_others` array path.
+                                                      Equivalent to calling `self.group_and_nest_non_grouping_keys(paths_config, new_path_for_others)`.
+            new_root_key (str, optional): Only relevant when `new_path_for_others` is NOT provided.
+                                          If provided, all projected paths will be nested under this new key.
+            new_path_for_others (str, optional): Only relevant when `paths_config` is a list of paths to keep.
+                                               The name of the new path where all other attributes will be collected into an array.
 
+        Returns:
+            DataGuidePath or tuple:
+                - DataGuidePath: A new DataGuidePath object with the transformed schema.
+                - If `group_and_nest_non_grouping_keys` is called, returns (DataGuidePath, dict) with a report.
+        """
+        if not isinstance(paths_config, list):
+            raise TypeError("paths_config must be a list of Path objects or strings.")
+        
+        if not paths_config:
+            return DataGuidePath() # Return empty if no paths are configured
+
+        # Validate elements in paths_config
+        for item in paths_config:
+            if not isinstance(item, (Path, str)):
+                raise TypeError("All items in paths_config must be Path objects or strings.")
+
+        # Determine behavior based on presence of new_path_for_others
+        if new_path_for_others:
+            # Scenario: Group by paths_config, move others to new_path_for_others.*
+            # In this case, new_root_key is not applicable.
+            if new_root_key:
+                print("Warning: new_root_key is ignored when new_path_for_others is provided, as behavior defaults to grouping.")
+            
+            # The paths_config itself contains the grouping_keys_to_keep
+            grouping_keys_to_keep = paths_config 
+            return self.group_and_nest_non_grouping_keys(grouping_keys_to_keep, new_path_for_others)
+        else:
+            # Scenario: Simple projection, possibly with a new root key
+            # The paths_config contains the paths to project
+            paths_to_project = paths_config
+            return self.nest(paths_to_project, new_root_key=new_root_key)
+    
     def union(self, other):
         """
         Method used to union two dataguides, other is a second dataguide
@@ -869,144 +972,8 @@ class DataGuidePath:
         new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
         new_guide.total_docs = self.total_docs 
         return new_guide
-
-    def project(self, paths):
-        """
-        Return a new DataGuide with only the specified (possibly nested) paths.
-        Includes parent nodes as needed. Updates total_docs to reflect the
-        minimum number of documents that could contain all projected paths.
-        """
-        #Create a new DataGuide object for the projection result
-        new_guide = DataGuidePath()
-        
-        #Initialize an empty list to store the sum of counts for each specified path
-        min_counts = []
-
-        #Iterate through each path provided in the 'paths' list
-        for path_input in paths: 
-            #Determine if the input is a string or a Path object and convert if necessary
-            if isinstance(path_input, str):
-                path_obj = Path(path_input)
-            elif isinstance(path_input, Path):
-                path_obj = path_input
-            else:
-                #Raise an error for invalid input type
-                raise TypeError("Each path in the list must be a string or a Path object.")
-
-            #Attempt to traverse the current path in the original DataGuide(self)
-            source_leaf = self._traverse_path(path_obj) 
-            
-            #If the path does not exist, skip it and move to the next path
-            if source_leaf is None:
-                continue  
-            
-            #Sum all counter values for the 'source_leaf' node and append to min_counts
-            min_counts.append(sum(source_leaf.counters.values()))
-
-            #Initialize 'source_node' to the root of the original DataGuide.
-            source_node = self.root
-            
-            #Initialize 'target_node' to the root of the 'new_guide' (the projected DataGuide).
-            target_node = new_guide.root
-
-            #Iterate through each segment (part) of the current path.
-            for part in path_obj.get_parts(): 
-                #Check if the current 'part' exists as a child in the 'source_node'
-                if part not in source_node.children:
-                    #If it doesn't exist, it means the path was incomplete or incorrect
-                    break
-
-                #If the current 'part' does not exist as a child in the 'target_node', create a new Node for it.
-                if part not in target_node.children:
-                    target_node.children[part] = Node()
-
-                #Move 'source_node' down to its child corresponding to 'part'
-                source_node = source_node.children[part]
-                
-                #Move 'target_node' down to its newly created or existing child corresponding to 'part'
-                target_node = target_node.children[part]
-
-                #Copy the counters from the 'source_node' to the 'target_node'
-                target_node.counters = source_node.counters.copy()
-
-        #Calculate the sum of all counts collected for the specified paths
-        sum_counts = sum(min_counts)
-        
-        #Set the 'total_docs' for the new projected DataGuide
-        new_guide.total_docs = min(self.total_docs, sum_counts)
-        
-        #Return the newly created DataGuide
-        return new_guide
-    def intersect(self, other):
-        """
-        Method to intersect two dataguides, as if an intersection was performed on original JSON documents
-        """
-        #Save document counts
-        m1, m2 = self.total_docs, other.total_docs
-        
-        #Save paths of dataguides
-        self_paths = set(self._gather_paths(self.root))
-        other_paths = set(self._gather_paths(other.root))
-        
-        #Paths present in both dataguides
-        common_paths = self_paths & other_paths
-
-        #Number of paths in each dataguide not in other dataguide
-        n1 = self._max_noncommon(self_paths, common_paths)
-        n2 = self._max_noncommon(other_paths, common_paths)
-
-        #Find minimum difference of document count to noncommon paths between guides
-        #This is the number of documents present in the resulting intersection dataguide
-        m_int = min(m1 - n1, m2 - n2)
-        #Ensure m_int is not negative
-        if m_int < 0: 
-            m_int = 0
-        
-        #Create resulting dataguide and set total documents
-        result = DataGuidePath()
-        result.total_docs = m_int
-
-        #Iterate over common paths, sorted by their string representation
-        for path_obj in sorted(common_paths, key=str):
-            #Get nodes of paths from both guides
-            n1_node = self._traverse_path(path_obj) 
-            n2_node = other._traverse_path(path_obj)
-            #Dictionary used to combine common path counts
-            comb = {}
-            #Iterate over counters in nodes
-            for t in set(n1_node.counters) | set(n2_node.counters):
-                #Get counts of each type in each node
-                c1 = n1_node.counters.get(t, 0)
-                c2 = n2_node.counters.get(t, 0)
-                #Get minimum count between common nodes
-                val = min(c1, c2)
-                #If value count is above zero, store count as minimum between value and document count
-                if val > 0:
-                    comb[t] = min(val, m_int)
-                #Else store count as zero for that type
-                else:
-                    comb[t] = 0
-
-            #If entire sum of values in comb dictionary is zero, move to next node
-            if sum(comb.values()) == 0:
-                continue
-
-            #Set current node to root of the result guide
-            current = result.root
-            #Iterate over path parts
-            for part in path_obj.get_parts(): 
-                #Create new child node for current node if not already present
-                current = current.children.setdefault(part, Node())
-            #Set counters of current node to the combined counts
-            current.counters = comb
-        #Set root object counter to number of unique documents in the intersection
-        result.root.counters['obj'] = m_int
-        #Ensure root object counter has at least one node if there are children
-        result._ensure_root_obj()
-        
-        return result  
     
-    def nest_by_grouping_keys(self, grouping_keys, new_path_for_others):
+    def group_and_nest_non_grouping_keys(self, grouping_keys, new_path_for_others):
         """
         Groups documents by 'grouping_keys' (kept at their original level)
         and moves 'all other attributes' into a new array path.
@@ -1128,6 +1095,143 @@ class DataGuidePath:
         
         return new_guide, report
 
+    def project(self, paths):
+        """
+        Return a new DataGuide with only the specified (possibly nested) paths.
+        Includes parent nodes as needed. Updates total_docs to reflect the
+        minimum number of documents that could contain all projected paths.
+        """
+        #Create a new DataGuide object for the projection result
+        new_guide = DataGuidePath()
+        
+        #Initialize an empty list to store the sum of counts for each specified path
+        min_counts = []
+
+        #Iterate through each path provided in the 'paths' list
+        for path_input in paths: 
+            #Determine if the input is a string or a Path object and convert if necessary
+            if isinstance(path_input, str):
+                path_obj = Path(path_input)
+            elif isinstance(path_input, Path):
+                path_obj = path_input
+            else:
+                #Raise an error for invalid input type
+                raise TypeError("Each path in the list must be a string or a Path object.")
+
+            #Attempt to traverse the current path in the original DataGuide(self)
+            source_leaf = self._traverse_path(path_obj) 
+            
+            #If the path does not exist, skip it and move to the next path
+            if source_leaf is None:
+                continue  
+            
+            #Sum all counter values for the 'source_leaf' node and append to min_counts
+            min_counts.append(sum(source_leaf.counters.values()))
+
+            #Initialize 'source_node' to the root of the original DataGuide.
+            source_node = self.root
+            
+            #Initialize 'target_node' to the root of the 'new_guide' (the projected DataGuide).
+            target_node = new_guide.root
+
+            #Iterate through each segment (part) of the current path.
+            for part in path_obj.get_parts(): 
+                #Check if the current 'part' exists as a child in the 'source_node'
+                if part not in source_node.children:
+                    #If it doesn't exist, it means the path was incomplete or incorrect
+                    break
+
+                #If the current 'part' does not exist as a child in the 'target_node', create a new Node for it.
+                if part not in target_node.children:
+                    target_node.children[part] = Node()
+
+                #Move 'source_node' down to its child corresponding to 'part'
+                source_node = source_node.children[part]
+                
+                #Move 'target_node' down to its newly created or existing child corresponding to 'part'
+                target_node = target_node.children[part]
+
+                #Copy the counters from the 'source_node' to the 'target_node'
+                target_node.counters = source_node.counters.copy()
+
+        #Calculate the sum of all counts collected for the specified paths
+        sum_counts = sum(min_counts)
+        
+        #Set the 'total_docs' for the new projected DataGuide
+        new_guide.total_docs = min(self.total_docs, sum_counts)
+        
+        #Return the newly created DataGuide
+        return new_guide
+    
+    def intersect(self, other):
+        """
+        Method to intersect two dataguides, as if an intersection was performed on original JSON documents
+        """
+        #Save document counts
+        m1, m2 = self.total_docs, other.total_docs
+        
+        #Save paths of dataguides
+        self_paths = set(self._gather_paths(self.root))
+        other_paths = set(self._gather_paths(other.root))
+        
+        #Paths present in both dataguides
+        common_paths = self_paths & other_paths
+
+        #Number of paths in each dataguide not in other dataguide
+        n1 = self._max_noncommon(self_paths, common_paths)
+        n2 = self._max_noncommon(other_paths, common_paths)
+
+        #Find minimum difference of document count to noncommon paths between guides
+        #This is the number of documents present in the resulting intersection dataguide
+        m_int = min(m1 - n1, m2 - n2)
+        #Ensure m_int is not negative
+        if m_int < 0: 
+            m_int = 0
+        
+        #Create resulting dataguide and set total documents
+        result = DataGuidePath()
+        result.total_docs = m_int
+
+        #Iterate over common paths, sorted by their string representation
+        for path_obj in sorted(common_paths, key=str):
+            #Get nodes of paths from both guides
+            n1_node = self._traverse_path(path_obj) 
+            n2_node = other._traverse_path(path_obj)
+            #Dictionary used to combine common path counts
+            comb = {}
+            #Iterate over counters in nodes
+            for t in set(n1_node.counters) | set(n2_node.counters):
+                #Get counts of each type in each node
+                c1 = n1_node.counters.get(t, 0)
+                c2 = n2_node.counters.get(t, 0)
+                #Get minimum count between common nodes
+                val = min(c1, c2)
+                #If value count is above zero, store count as minimum between value and document count
+                if val > 0:
+                    comb[t] = min(val, m_int)
+                #Else store count as zero for that type
+                else:
+                    comb[t] = 0
+
+            #If entire sum of values in comb dictionary is zero, move to next node
+            if sum(comb.values()) == 0:
+                continue
+
+            #Set current node to root of the result guide
+            current = result.root
+            #Iterate over path parts
+            for part in path_obj.get_parts(): 
+                #Create new child node for current node if not already present
+                current = current.children.setdefault(part, Node())
+            #Set counters of current node to the combined counts
+            current.counters = comb
+        #Set root object counter to number of unique documents in the intersection
+        result.root.counters['obj'] = m_int
+        #Ensure root object counter has at least one node if there are children
+        result._ensure_root_obj()
+        
+        return result  
+    
     def _nest_matched_paths_and_filter_others(self, grouping_keys, new_nested_key_name, include_partial_or_null=False):
         """
         (Variant 1 of Group/Nest)
@@ -1295,6 +1399,8 @@ class DataGuidePath:
             union_of_projections_from_top_levels = union_of_projections_from_top_levels.union(proj_guide)
             
         return union_of_projections_from_top_levels.total_docs
+    
+  
     def _get_intuitive_intersection_docs_count(self, guide1, guide2):
         """
         Helper to provide a more intuitive document intersection count for potentially disjoint schema paths.
