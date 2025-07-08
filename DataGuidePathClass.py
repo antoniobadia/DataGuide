@@ -593,7 +593,9 @@ class DataGuidePath:
         new_guide.total_docs = self.total_docs
         return new_guide
     
-    # new method for testin 12:35am
+
+
+    # latest method 12:36am 07/09 that is working, adding code to support argument 2
     def nest_schema(self, paths_config, new_root_key=None, new_path_for_others=None):
         """
         Enhanced dispatcher: supports list of paths, or list of (newpath, [list of paths]).
@@ -616,6 +618,14 @@ class DataGuidePath:
             for g in guides[1:]:
                 result = result.union(g)
             return result
+        
+        # New code 07/09 12:38am to check:
+        # Check for Argument Type 2: list of (fname, path, newpath)
+        if all(isinstance(item, tuple) and len(item) == 3 and isinstance(item[0], str) for item in paths_config):
+            fname_set = {item[0] for item in paths_config}
+            if fname_set.issubset({"sum", "count", "avg", "min", "max"}):
+                return self._apply_aggregations(paths_config)
+
         
         # Fallback to old behavior
         if new_path_for_others:
@@ -1596,5 +1606,77 @@ class DataGuidePath:
             estimated_docs_with_other_attributes_moved = min(self.total_docs, estimated_docs_with_other_attributes_moved)
 
         return estimated_docs_with_other_attributes_moved
+
+    # New function 07/08 - 07/09 for arguement 2 in taking aggregates
+    def _apply_aggregations(self, aggregation_specs):
+        """
+        Handles list of (fname, path, newpath) aggregation specs.
+        Implements validation and output type promotion.
+
+        Returns:
+            DataGuidePath: Transformed guide with new schema.
+        """
+        allowed_funcs = {"sum", "count", "avg", "min", "max"}
+        numeric_funcs = {"sum", "avg"}
+        all_funcs = {"sum", "count", "avg", "min", "max"}
+
+        seen_newpaths = set()
+        path_node_map = {}
+
+        for spec in aggregation_specs:
+            if len(spec) != 3:
+                raise ValueError("Each aggregation spec must be a 3-tuple: (fname, path, newpath)")
+
+            fname, source_path_raw, target_path_raw = spec
+
+            if fname not in all_funcs:
+                raise ValueError(f"Unsupported aggregation function: {fname}")
+
+            source_path = Path(source_path_raw) if isinstance(source_path_raw, str) else source_path_raw
+            target_path = Path(target_path_raw) if isinstance(target_path_raw, str) else target_path_raw
+
+            if target_path in seen_newpaths:
+                raise ValueError(f"Duplicate aggregation target path: {target_path}")
+            seen_newpaths.add(target_path)
+
+            node = self._traverse_path(source_path)
+            if not node:
+                print(f"Skipping: source path {source_path} not found in guide.")
+                continue
+
+            # Type validation based on aggregation function
+            counters = node.counters
+            if fname in numeric_funcs:
+                if not (counters.get("int", 0) or counters.get("float", 0)):
+                    #print(f"Skipping: cannot apply {fname} on non-numeric path {source_path}.")
+                    continue
+            elif fname in {"min", "max"}:
+                if not any(t in counters for t in ("int", "float", "str", "date")):
+                    #print(f"Skipping: {fname} not valid on {source_path} with types {list(counters.keys())}")
+                    continue
+            elif fname == "count":
+                pass  # any type is allowed
+
+            # Create output node with correct inferred type
+            agg_node = Node()
+            if fname == "count":
+                agg_node.counters["int"] = 1
+            elif counters.get("float", 0):
+                agg_node.counters["float"] = 1
+            elif counters.get("int", 0):
+                # Even if int only, promote to float
+                agg_node.counters["int"] = 1
+            elif counters.get("date", 0):
+                agg_node.counters["date"] = 1
+            elif counters.get("str", 0):
+                agg_node.counters["str"] = 1
+
+            path_node_map[target_path] = agg_node
+
+        new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
+        new_guide.total_docs = self.total_docs
+        return new_guide
+
+
 
 
