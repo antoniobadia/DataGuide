@@ -1168,8 +1168,7 @@ class DataGuidePath:
         
         return new_guide # Removed report output
 
-    # This project works as intended, it is limited by dataguide since two or more paths may exist in same document but dataguide does store enough data 
-    # To tell if the two or more projected paths exist in the same document.
+    # This project works as intended 07.10.2025 it updates the total_docs to account for only paths that start at the root
     def project(self, paths_to_search_for, new_root_key=None):
         """
         Return a new DataGuide with only paths that contain any of the specified
@@ -1202,7 +1201,8 @@ class DataGuidePath:
         matched_original_full_paths = set()
         for original_leaf_path_obj in all_original_leaf_paths:
             for search_sub_path_obj in processed_search_paths:
-                if self._path_contains_subpath(original_leaf_path_obj, search_sub_path_obj):
+                # This aprt was once again updated so that the project total_docs only counts paths that start at the root.
+                if original_leaf_path_obj.starts_with(search_sub_path_obj):
                     matched_original_full_paths.add(original_leaf_path_obj)
                     break 
 
