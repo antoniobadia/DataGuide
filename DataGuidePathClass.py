@@ -593,10 +593,60 @@ class DataGuidePath:
         new_guide.total_docs = self.total_docs
         return new_guide
     
+    # New method for nest_schema 07/10
+    def nest_schema(self, grouping_paths=None, nest_specs=None, aggregations=None, new_path_for_others=None):
+        """
+        Supports:
+        - grouping_paths: list of paths to keep at root (like 'deptid')
+        - nest_specs: list of (newpath, list(path)) pairs (list(path) may be empty)
+            → These define nested arrays where each entry contains those paths
+        - new_path_for_others: fallback for legacy usage (e.g., group-and-nest-everything-else)
+        """
+        if not grouping_paths and not nest_specs:
+            return DataGuidePath()
+
+        grouping_paths = [Path(p) if isinstance(p, str) else p for p in (grouping_paths or [])]
+        guides = []
+
+        # 1. Retain grouping paths directly
+        if grouping_paths:
+            guides.append(self.nest(grouping_paths))
+
+        # 2. Handle nest_specs: list of (newpath, list(path)) where list(path) may be empty
+        if nest_specs:
+            for newpath_raw, included_paths in nest_specs:
+                newpath = Path(newpath_raw) if isinstance(newpath_raw, str) else newpath_raw
+
+                # If included_paths is empty, gather all non-grouping paths
+                if not included_paths:
+                    all_paths = self._gather_paths(self.root)
+                    included_paths = [
+                        p for p in all_paths
+                        if not any(p.starts_with(gp) for gp in grouping_paths)
+                    ]
+
+                # Run nesting logic (updated _nest_struct_into_array will handle it)
+                guides.append(self._nest_struct_into_array(newpath, included_paths))
+
+        # 3. Handle aggregation-only case (argument 2)
+        if aggregations:
+            guides.append(self._apply_aggregations(aggregations))
+
+        # Merge all guide pieces
+        if not guides:
+            return DataGuidePath()
+
+        result = guides[0]
+        for g in guides[1:]:
+            result = result.union(g)
+
+        result.total_docs = self.total_docs
+        return result
+
 
 
     # latest method 12:36am 07/09 that is working, adding code to support argument 2
-    def nest_schema(self, paths_config, new_root_key=None, new_path_for_others=None):
+    #def nest_schema(self, paths_config, new_root_key=None, new_path_for_others=None):
         """
         Enhanced dispatcher: supports list of paths, or list of (newpath, [list of paths]).
         """
@@ -733,8 +783,8 @@ class DataGuidePath:
             # Call the now-updated project method, which handles fuzzy matching and new_root_key
             return self.project(paths_to_project, new_root_key=new_root_key)
 
-    # new method to go with nest_schema testing 7/8/25
-    def _nest_struct_into_array(self, new_array_path, paths_to_group):
+    # new method to go with nest_schema testing 7/8/25, comminting out 07/11
+    # def _nest_struct_into_array(self, new_array_path, paths_to_group):
         """
         Correctly nests multiple related paths into a single object inside an array.
         Ensures paths from the same top-level object are grouped under one `*` entry.
@@ -765,6 +815,49 @@ class DataGuidePath:
                         base_path = base_path.append(group_path.get_parts()[-1])
 
                     path_node_map[base_path] = source_node
+
+        new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
+        new_guide.total_docs = self.total_docs
+        return new_guide
+    # updated to reflect wanted struture for DG 07/11
+    def _nest_struct_into_array(self, new_array_path, paths_to_group):
+        """
+        Creates an array field under `new_array_path`, where each element is a struct (object)
+        containing the full structure of each path in `paths_to_group`.
+
+        Parameters:
+            - new_array_path: Path where array will be created (e.g., 'emps')
+            - paths_to_group: List of input paths to nest under `new_array_path.*`
+
+        Returns:
+            A new DataGuidePath with the nested array structure.
+        """
+        if not isinstance(new_array_path, Path):
+            new_array_path = Path(new_array_path)
+
+        processed_paths = [Path(p) if isinstance(p, str) else p for p in paths_to_group]
+        path_node_map = {}
+        all_leaf_paths = self._gather_paths(self.root)
+
+        for leaf_path in all_leaf_paths:
+            for group_root_path in processed_paths:
+                if leaf_path.starts_with(group_root_path):
+                    source_node = self._traverse_path(leaf_path)
+                    if not source_node:
+                        continue
+
+                    # Create nested path like emps.*.emp.name
+                    transformed_path = new_array_path.append("*")
+                    for part in leaf_path.get_parts():
+                        transformed_path = transformed_path.append(part)
+
+                    path_node_map[transformed_path] = source_node
+                    break  # skip to next leaf_path
+
+        # ✅ Fix: ensure `new_array_path` itself is marked as an array
+        array_node = Node()
+        array_node.counters["arr"] = 1
+        path_node_map[new_array_path] = array_node
 
         new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
         new_guide.total_docs = self.total_docs
@@ -848,14 +941,17 @@ class DataGuidePath:
                 # Set obj/arr counter to 1 if it means it became a parent.
                 # This signifies structural integrity, but not sum of original occurrences.
                 # Start with if it's not the leaf itself
-                if i < len(parts) - 1: 
-                    next_part = parts[i+1]
-                    # If the next part implies an array element, mark parent as array container
-                    if next_part == '*' and current_target_node.counters['arr'] == 0:
-                        current_target_node.counters['arr'] = 1
-                    # Otherwise, if it's not array and current obj count is 0, mark parent as object container
-                    elif next_part != '*' and current_target_node.counters['obj'] == 0:
-                        current_target_node.counters['obj'] = 1
+                if i < len(parts) - 1:
+                    next_part = parts[i + 1]
+
+                    if next_part == "*":
+                        # Mark as array container
+                        current_target_node.counters["arr"] = 1
+                    else:
+                        # Only mark as object if not already marked as array
+                        if current_target_node.counters["arr"] == 0:
+                            current_target_node.counters["obj"] = 1
+
 
                 current_target_node = current_target_node.children[part]
             
@@ -1608,7 +1704,7 @@ class DataGuidePath:
         return estimated_docs_with_other_attributes_moved
 
     # New function 07/08 - 07/09 for arguement 2 in taking aggregates
-    def _apply_aggregations(self, aggregation_specs):
+    # def _apply_aggregations(self, aggregation_specs):
         """
         Handles list of (fname, path, newpath) aggregation specs.
         Implements validation and output type promotion.
@@ -1677,6 +1773,64 @@ class DataGuidePath:
         new_guide.total_docs = self.total_docs
         return new_guide
 
+    # Even neweer helper function 07/10
+    def _apply_aggregations(self, aggregation_specs):
+        """
+        Handles list of (fname, path, newpath) aggregation specs.
+        Returns a new DataGuidePath with each aggregation result placed at `newpath`.
+        """
+        allowed_funcs = {"sum", "count", "avg", "min", "max"}
+        path_node_map = {}
 
+        for spec in aggregation_specs:
+            if len(spec) != 3:
+                raise ValueError("Each aggregation spec must be (fname, source_path, newpath)")
 
+            fname, source_path_raw, target_path_raw = spec
 
+            if fname not in allowed_funcs:
+                raise ValueError(f"Unsupported aggregation function: {fname}")
+
+            source_path = Path(source_path_raw)
+            target_path = Path(target_path_raw)
+
+            node = self._traverse_path(source_path)
+            if not node:
+                print(f"Skipping aggregation: {source_path} not found in guide.")
+                continue
+
+            # Create the output node
+            agg_node = Node()
+
+            # Determine output type
+            if fname == "count":
+                agg_node.counters["int"] = 1  # count is always int
+            elif fname in {"sum", "avg"}:
+                if node.counters.get("float", 0) or node.counters.get("int", 0):
+                    agg_node.counters["float"] = 1
+                else:
+                    print(f"Skipping aggregation: {fname} cannot apply to non-numeric {source_path}")
+                    continue
+            elif fname in {"min", "max"}:
+                found_type = None
+                for t in ["int", "float", "str", "date"]:
+                    if node.counters.get(t, 0):
+                        found_type = t
+                        break
+                if not found_type:
+                    print(f"Skipping aggregation: {fname} has no valid types for {source_path}")
+                    continue
+                agg_node.counters[found_type] = 1
+
+            path_node_map[target_path] = agg_node
+
+        if not path_node_map:
+            print("No valid aggregation outputs were generated.")
+            return DataGuidePath()
+
+        # Build new guide
+        new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
+        new_guide.total_docs = self.total_docs
+        return new_guide
+
+    
