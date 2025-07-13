@@ -505,40 +505,7 @@ class DataGuidePath:
                 total[key] = total.get(key, 0) + value
         return total
     
-    #def nest(self, fuzzy_key_objs_list):
-    #     """
-    #     Returns a new DataGuidePath object containing only the leaf paths
-    #     from the original guide that contain ANY of the given fuzzy_key_objs
-    #     as a sub-path.
-        
-    #     Args:
-    #         fuzzy_key_objs_list (list of Path): A list of Path objects to search for.
-
-    #     Returns:
-    #         DataGuidePath: A new DataGuidePath object with only the matching paths.
-    #     """
-    #     if not isinstance(fuzzy_key_objs_list, list):
-    #         raise TypeError("fuzzy_key_objs_list must be a list of Path objects.")
-    #     for key_obj in fuzzy_key_objs_list:
-    #         if not isinstance(key_obj, Path):
-    #             raise TypeError("All items in fuzzy_key_objs_list must be Path objects.")
-
-    #     all_original_leaf_paths = self._gather_paths(self.root)
-        
-    #     paths_to_project = []
-    #     for leaf_path_obj in all_original_leaf_paths:
-    #         should_include_leaf = False
-    #         for fuzzy_key_to_match in fuzzy_key_objs_list: # Iterate through the list of fuzzy keys
-    #             if self._path_contains_subpath(leaf_path_obj, fuzzy_key_to_match): # Check if it contains ANY of them
-    #                 should_include_leaf = True
-    #                 break # Found a match for this leaf path, no need to check other fuzzy keys
-            
-    #         if should_include_leaf:
-    #             paths_to_project.append(leaf_path_obj)
-                
-    #     return self.project(paths_to_project)
-
-    # was working but has bugs removing for now
+    
     def nest(self, paths_to_project, new_root_key=None):
         """
         Returns a new DataGuidePath object containing only the specified paths.
@@ -593,7 +560,6 @@ class DataGuidePath:
         new_guide.total_docs = self.total_docs
         return new_guide
     
-    # New method for nest_schema 07/10
     def nest_schema(self, grouping_paths=None, nest_specs=None, aggregations=None, new_path_for_others=None):
         """
         Supports:
@@ -625,7 +591,6 @@ class DataGuidePath:
                         if not any(p.starts_with(gp) for gp in grouping_paths)
                     ]
 
-                # Run nesting logic (updated _nest_struct_into_array will handle it)
                 guides.append(self._nest_struct_into_array(newpath, included_paths))
 
         # 3. Handle aggregation-only case (argument 2)
@@ -641,185 +606,13 @@ class DataGuidePath:
             result = result.union(g)
 
         result.total_docs = self.total_docs
+        max_docs_est, min_docs_est = self._estimate_doc_impact_bounds(grouping_paths, aggregations)
+        result.max_docs_est = max_docs_est
+        result.min_docs_est = min_docs_est
+
+
         return result
-
-
-
-    # latest method 12:36am 07/09 that is working, adding code to support argument 2
-    #def nest_schema(self, paths_config, new_root_key=None, new_path_for_others=None):
-        """
-        Enhanced dispatcher: supports list of paths, or list of (newpath, [list of paths]).
-        """
-        if not paths_config:
-            return DataGuidePath()
-        
-        # Detect tuple format: [(Path("newpath"), [Path("x.y"), Path("x.z")])]
-        if all(isinstance(item, tuple) and len(item) == 2 for item in paths_config):
-            # Multiple array structs to generate
-            guides = []
-            for new_array_path, group_paths in paths_config:
-                if isinstance(new_array_path, str):
-                    new_array_path = Path(new_array_path)
-                guide = self._nest_struct_into_array(new_array_path, group_paths)
-                guides.append(guide)
-            
-            # Union all the generated guides
-            result = guides[0]
-            for g in guides[1:]:
-                result = result.union(g)
-            return result
-        
-        # New code 07/09 12:38am to check:
-        # Check for Argument Type 2: list of (fname, path, newpath)
-        if all(isinstance(item, tuple) and len(item) == 3 and isinstance(item[0], str) for item in paths_config):
-            fname_set = {item[0] for item in paths_config}
-            if fname_set.issubset({"sum", "count", "avg", "min", "max"}):
-                return self._apply_aggregations(paths_config)
-
-        
-        # Fallback to old behavior
-        if new_path_for_others:
-            if new_root_key:
-                print("Warning: new_root_key is ignored when new_path_for_others is provided.")
-            return self.group_and_nest_non_grouping_keys(paths_config, new_path_for_others)
-        else:
-            return self.nest(paths_config, new_root_key=new_root_key)
-
-
-    #was working but needs modification 7/8/2025 12:34am removed
-    # def nest_schema(self, paths_config, new_root_key=None, new_path_for_others=None):
-        """
-        A unified method to perform schema nesting based on the input configuration.
-
-        Args:
-            paths_config (list of Path or str):
-                If `new_path_for_others` is NOT provided: Projects only the specified paths.
-                                                          Equivalent to calling `self.nest(paths_config, new_root_key=new_root_key)`.
-                If `new_path_for_others` IS provided: Groups documents by the paths in `paths_config` (kept at their original level)
-                                                      and moves 'all other attributes' into the `new_path_for_others` array path.
-                                                      Equivalent to calling `self.group_and_nest_non_grouping_keys(paths_config, new_path_for_others)`.
-            new_root_key (str, optional): Only relevant when `new_path_for_others` is NOT provided.
-                                          If provided, all projected paths will be nested under this new key.
-            new_path_for_others (str, optional): Only relevant when `paths_config` is a list of paths to keep.
-                                               The name of the new path where all other attributes will be collected into an array.
-
-        Returns:
-            DataGuidePath or tuple:
-                - DataGuidePath: A new DataGuidePath object with the transformed schema.
-                - If `group_and_nest_non_grouping_keys` is called, returns (DataGuidePath, dict) with a report.
-        """
-        if not isinstance(paths_config, list):
-            raise TypeError("paths_config must be a list of Path objects or strings.")
-        
-        if not paths_config:
-            return DataGuidePath() # Return empty if no paths are configured
-
-        # Validate elements in paths_config
-        for item in paths_config:
-            if not isinstance(item, (Path, str)):
-                raise TypeError("All items in paths_config must be Path objects or strings.")
-
-        # Determine behavior based on presence of new_path_for_others
-        if new_path_for_others:
-            # Scenario: Group by paths_config, move others to new_path_for_others.*
-            # In this case, new_root_key is not applicable.
-            if new_root_key:
-                print("Warning: new_root_key is ignored when new_path_for_others is provided, as behavior defaults to grouping.")
-            
-            # The paths_config itself contains the grouping_keys_to_keep
-            grouping_keys_to_keep = paths_config 
-            return self.group_and_nest_non_grouping_keys(grouping_keys_to_keep, new_path_for_others)
-        else:
-            # Scenario: Simple projection, possibly with a new root key
-            # The paths_config contains the paths to project
-            paths_to_project = paths_config
-            return self.nest(paths_to_project, new_root_key=new_root_key)
-    #adding new nest for testing 7/7/20225
-    #def nest(self, paths_to_project, new_root_key=None):
-        # This 'nest' method is now essentially a wrapper for 'project' with new_root_key
-        # It's kept for backward compatibility with the `nest_schema` dispatcher logic.
-        return self.project(paths_to_project, new_root_key=new_root_key)
     
-    # new test updated 7/7/2025
-    #def nest_schema(self, paths_config, new_root_key=None, new_path_for_others=None):
-        """
-        A unified method to perform schema nesting based on the input configuration.
-
-        Args:
-            paths_config (list of Path or str):
-                If `new_path_for_others` is NOT provided: Projects only the specified paths (fuzzy match).
-                                                          Effectively calls `self.project(paths_config, new_root_key=new_root_key)`.
-                If `new_path_for_others` IS provided: Groups documents by the paths in `paths_config` (kept at their original level)
-                                                      and moves 'all other attributes' into the `new_path_for_others` array path.
-                                                      Effectively calls `self.group_and_nest_non_grouping_keys(paths_config, new_path_for_others)`.
-            new_root_key (str, optional): Only relevant when `new_path_for_others` is NOT provided.
-                                          If provided, all projected paths will be nested under this new key.
-            new_path_for_others (str, optional): Only relevant when `paths_config` is a list of paths to keep.
-                                               The name of the new path where all other attributes will be collected into an array.
-
-        Returns:
-            DataGuidePath or tuple:
-                - DataGuidePath: A new DataGuidePath object with the transformed schema.
-                - If `group_and_nest_non_grouping_keys` is called, returns (DataGuidePath, dict) with a report.
-        """
-        if not isinstance(paths_config, list):
-            raise TypeError("paths_config must be a list of Path objects or strings.")
-        
-        if not paths_config:
-            return DataGuidePath()
-
-        for item in paths_config:
-            if not isinstance(item, (Path, str)):
-                raise TypeError("All items in paths_config must be Path objects or strings.")
-
-        if new_path_for_others:
-            if new_root_key:
-                print("Warning: new_root_key is ignored when new_path_for_others is provided, as behavior defaults to grouping.")
-            
-            grouping_keys_to_keep = paths_config 
-            return self.group_and_nest_non_grouping_keys(grouping_keys_to_keep, new_path_for_others)
-        else:
-            paths_to_project = paths_config
-            # Call the now-updated project method, which handles fuzzy matching and new_root_key
-            return self.project(paths_to_project, new_root_key=new_root_key)
-
-    # new method to go with nest_schema testing 7/8/25, comminting out 07/11
-    # def _nest_struct_into_array(self, new_array_path, paths_to_group):
-        """
-        Correctly nests multiple related paths into a single object inside an array.
-        Ensures paths from the same top-level object are grouped under one `*` entry.
-        """
-        if not isinstance(new_array_path, Path):
-            new_array_path = Path(new_array_path)
-
-        processed_paths = [Path(p) if isinstance(p, str) else p for p in paths_to_group]
-
-        path_node_map = {}
-        all_leaf_paths = self._gather_paths(self.root)
-
-        # Group all leaf paths that match any of the group_paths
-        for group_path in processed_paths:
-            for leaf_path in all_leaf_paths:
-                if leaf_path.starts_with(group_path):
-                    source_node = self._traverse_path(leaf_path)
-                    if not source_node:
-                        continue
-
-                    suffix_parts = leaf_path.get_parts()[len(group_path.get_parts()):]
-                    base_path = new_array_path.append("*")
-                    for part in suffix_parts:
-                        base_path = base_path.append(part)
-
-                    # Include the matched group_path base itself
-                    if not suffix_parts:
-                        base_path = base_path.append(group_path.get_parts()[-1])
-
-                    path_node_map[base_path] = source_node
-
-        new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
-        new_guide.total_docs = self.total_docs
-        return new_guide
-    # updated to reflect wanted struture for DG 07/11
     def _nest_struct_into_array(self, new_array_path, paths_to_group):
         """
         Creates an array field under `new_array_path`, where each element is a struct (object)
@@ -863,6 +656,65 @@ class DataGuidePath:
         new_guide.total_docs = self.total_docs
         return new_guide
 
+    # Helper function for nest_schema
+    def _estimate_doc_impact_bounds(self, grouping_paths, aggregations=None):
+        """
+        Estimate upper and lower bounds on the number of documents
+        that could be impacted by a grouping + aggregation query.
+
+        Returns:
+            (max_est, min_est)
+        """
+        total = self.total_docs
+
+        grouping_paths = [Path(p) if isinstance(p, str) else p for p in (grouping_paths or [])]
+        aggregation_paths = [Path(p) if isinstance(p, str) else p for (_, p, _) in (aggregations or [])]
+
+        group_counts = [self.get_path_count(p) for p in grouping_paths]
+        agg_counts = [self.get_path_count(p) for p in aggregation_paths]
+
+        # Conservative max: assume all docs with agg path contribute
+        # (because grouping paths are almost always present)
+        max_est = min(total, sum(agg_counts))
+
+        # Conservative min: overlap of both sets
+        if grouping_paths and aggregation_paths:
+            min_est = min(
+                min(group_counts, default=0),
+                min(agg_counts, default=0)
+            )
+        else:
+            min_est = min(group_counts + agg_counts + [0])
+
+        return (max_est, min_est)
+    
+    #Helper function to _estimate_doc_impact_bounds
+    def get_path_count(self, path):
+        """
+        Returns the total count of all values under the given path.
+        Used for estimating document impact in grouping.
+        """
+        if isinstance(path, str):
+            path = Path(path)
+        elif not isinstance(path, Path):
+            raise TypeError("Path must be a string or a Path object.")
+        
+        node = self._traverse_path(path)
+        if not node:
+            return 0
+        return sum(node.counters.values())
+
+    # Output function for _estimate_doc_impact_bounds
+    def get_estimate_bounds(self):
+        """
+        Returns a dictionary with min/max doc estimates for the guide.
+        Only available if generated by nest_schema.
+        """
+        return {
+            "total_docs": getattr(self, "total_docs", None),
+            "max_docs_est impacted": getattr(self, "max_docs_est", None),
+            "min_docs_est impacted": getattr(self, "min_docs_est", None),
+        }
 
     def union(self, other):
         """
@@ -911,7 +763,6 @@ class DataGuidePath:
                 new_node.children[key] = self._clone_subtree(child2)
         return new_node
 
-    """ ==== These methods use Path Class ==== """
 
     def _rebuild_guide_from_path_node_map(self, path_node_map):
         """
@@ -1534,68 +1385,6 @@ class DataGuidePath:
         # cannot exceed the number of documents in the smaller of the two guides (assuming projection correctly sets total_docs).
         return min(guide1.total_docs, guide2.total_docs)
 
-    # removing for now 7/7/2025 was working
-    #def _estimate_docs_containing_any_fuzzy_key_occurrence(self, fuzzy_key_obj):
-        """
-        Estimates the total number of documents that contain at least one occurrence
-        of the given fuzzy_key_obj (sub-path) anywhere within their full paths.
-        This is done by projecting on all actual leaf paths that contain the fuzzy_key_obj
-        and then taking the union of those projections' total_docs.
-        """
-        if not isinstance(fuzzy_key_obj, Path):
-            raise TypeError("fuzzy_key_obj must be a Path object.")
-
-        all_original_leaf_paths = self._gather_paths(self.root)
-        
-        # Collect the *unique top-level segments* of all actual leaf paths that contain the fuzzy_key_obj.
-        # This is the most reliable way to count unique documents without document IDs.
-        unique_top_level_segments_matched = set()
-        for leaf_path_obj in all_original_leaf_paths:
-            if self._path_contains_subpath(leaf_path_obj, fuzzy_key_obj):
-                if leaf_path_obj.get_parts():
-                    unique_top_level_segments_matched.add(Path(leaf_path_obj.get_parts()[0]))
-
-        # Now, project on these unique top-level segments and union them.
-        # This union's total_docs should represent the count of unique documents.
-        union_of_projections_from_top_levels = DataGuidePath()
-        for top_level_path_obj in unique_top_level_segments_matched:
-            # Projecting on a top-level path should give total_docs for documents with that top-level path.
-            proj_guide = self.project([top_level_path_obj])
-            union_of_projections_from_top_levels = union_of_projections_from_top_levels.union(proj_guide)
-            
-        return union_of_projections_from_top_levels.total_docs
-    # new mothod for testing
-    #def _estimate_docs_containing_any_fuzzy_key_occurrence(self, fuzzy_key_obj):
-        """
-        Estimates the total number of documents that contain at least one occurrence
-        of the given fuzzy_key_obj (sub-path) anywhere within their full paths.
-        This is done by projecting on all actual leaf paths that contain the fuzzy_key_obj
-        and then taking the union of those projections' total_docs.
-        """
-        if not isinstance(fuzzy_key_obj, Path):
-            raise TypeError("fuzzy_key_obj must be a Path object.")
-
-        all_original_leaf_paths = self._gather_paths(self.root)
-        
-        # Collect the *unique top-level segments* of all actual leaf paths that contain the fuzzy_key_obj.
-        # This is the most reliable way to count unique documents without document IDs.
-        unique_top_level_segments_matched = set()
-        for leaf_path_obj in all_original_leaf_paths:
-            if self._path_contains_subpath(leaf_path_obj, fuzzy_key_obj):
-                if leaf_path_obj.get_parts():
-                    unique_top_level_segments_matched.add(Path(leaf_path_obj.get_parts()[0]))
-
-        # Now, project on these unique top-level segments and union them.
-        # This union's total_docs should represent the count of unique documents.
-        union_of_projections_from_top_levels = DataGuidePath()
-        for top_level_path_obj in unique_top_level_segments_matched:
-            # Projecting on a top-level path should give total_docs for documents with that top-level path.
-            proj_guide = self.project([top_level_path_obj])
-            union_of_projections_from_top_levels = union_of_projections_from_top_levels.union(proj_guide)
-            
-        return union_of_projections_from_top_levels.total_docs
-    
-    # new testing method 8:42pm 07/07/2025
     def _estimate_docs_containing_any_fuzzy_key_occurrence(self, fuzzy_key_obj):
         """
         Estimates the total number of documents that contain at least one occurrence
@@ -1703,77 +1492,6 @@ class DataGuidePath:
 
         return estimated_docs_with_other_attributes_moved
 
-    # New function 07/08 - 07/09 for arguement 2 in taking aggregates
-    # def _apply_aggregations(self, aggregation_specs):
-        """
-        Handles list of (fname, path, newpath) aggregation specs.
-        Implements validation and output type promotion.
-
-        Returns:
-            DataGuidePath: Transformed guide with new schema.
-        """
-        allowed_funcs = {"sum", "count", "avg", "min", "max"}
-        numeric_funcs = {"sum", "avg"}
-        all_funcs = {"sum", "count", "avg", "min", "max"}
-
-        seen_newpaths = set()
-        path_node_map = {}
-
-        for spec in aggregation_specs:
-            if len(spec) != 3:
-                raise ValueError("Each aggregation spec must be a 3-tuple: (fname, path, newpath)")
-
-            fname, source_path_raw, target_path_raw = spec
-
-            if fname not in all_funcs:
-                raise ValueError(f"Unsupported aggregation function: {fname}")
-
-            source_path = Path(source_path_raw) if isinstance(source_path_raw, str) else source_path_raw
-            target_path = Path(target_path_raw) if isinstance(target_path_raw, str) else target_path_raw
-
-            if target_path in seen_newpaths:
-                raise ValueError(f"Duplicate aggregation target path: {target_path}")
-            seen_newpaths.add(target_path)
-
-            node = self._traverse_path(source_path)
-            if not node:
-                print(f"Skipping: source path {source_path} not found in guide.")
-                continue
-
-            # Type validation based on aggregation function
-            counters = node.counters
-            if fname in numeric_funcs:
-                if not (counters.get("int", 0) or counters.get("float", 0)):
-                    #print(f"Skipping: cannot apply {fname} on non-numeric path {source_path}.")
-                    continue
-            elif fname in {"min", "max"}:
-                if not any(t in counters for t in ("int", "float", "str", "date")):
-                    #print(f"Skipping: {fname} not valid on {source_path} with types {list(counters.keys())}")
-                    continue
-            elif fname == "count":
-                pass  # any type is allowed
-
-            # Create output node with correct inferred type
-            agg_node = Node()
-            if fname == "count":
-                agg_node.counters["int"] = 1
-            elif counters.get("float", 0):
-                agg_node.counters["float"] = 1
-            elif counters.get("int", 0):
-                # Even if int only, promote to float
-                agg_node.counters["int"] = 1
-            elif counters.get("date", 0):
-                agg_node.counters["date"] = 1
-            elif counters.get("str", 0):
-                agg_node.counters["str"] = 1
-
-            path_node_map[target_path] = agg_node
-
-        new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
-        new_guide.total_docs = self.total_docs
-        return new_guide
-
-    # Even neweer helper function 07/10
     def _apply_aggregations(self, aggregation_specs):
         """
         Handles list of (fname, path, newpath) aggregation specs.
