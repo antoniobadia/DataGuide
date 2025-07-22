@@ -149,6 +149,17 @@ class Path:
             
         # Check if the initial segment of this path matches the prefix path's parts
         return self._parts[:len(prefix_path._parts)] == prefix_path._parts
+    
+    def endswith(self, suffix):
+        """
+        Returns True if the path ends with the given suffix.
+        The suffix can be a string or another Path object.
+        """
+        if isinstance(suffix, Path):
+            return self.get_parts()[-len(suffix.get_parts()):] == suffix.get_parts()
+        elif isinstance(suffix, str):
+            return self.get_parts() and self.get_parts()[-1] == suffix
+        return False
 
 class DataGuidePath:
     def __init__(self):
@@ -1551,4 +1562,177 @@ class DataGuidePath:
         new_guide.total_docs = self.total_docs
         return new_guide
 
-    
+    def unnest_schema(self, unnest_specs=None):
+        """
+        Flattens nested array fields in the schema based on the given unnest specifications.
+
+        Args:
+            unnest_specs (list of tuples): Each tuple has:
+                - A path ending in '.*' indicating the array to unnest (e.g., 'items.*')
+                - A list of relative field paths to extract (e.g., ['qty', 'price']).
+                If the list is empty, all fields inside the array are included.
+
+        Returns:
+            DataGuidePath: A new schema guide with the specified paths unnested.
+
+        Example:
+            unnest_schema([("items.*", ["qty", "price"])])
+            → flattens 'items.*.qty' and 'items.*.price' into 'items.qty' and 'items.price'
+        """
+        if not unnest_specs:
+            return self
+
+        final_path_node_map = {}
+        all_original_paths_flat = set()
+        all_paths_to_exclude = set()
+        force_arr_paths = set()
+
+        def _collect_all_paths(node, current_path_obj):
+            if str(current_path_obj) != "":
+                all_original_paths_flat.add(current_path_obj)
+            for key, child in node.children.items():
+                _collect_all_paths(child, current_path_obj.append(key))
+
+        _collect_all_paths(self.root, Path(""))
+
+        for source_array_path_raw, fields_to_unnest_list_raw in unnest_specs:
+            source_array_path_obj = Path(source_array_path_raw) if isinstance(source_array_path_raw, str) else source_array_path_raw
+            if not source_array_path_obj.endswith("*"):
+                raise ValueError(f"source_array_path '{source_array_path_obj}' must end with '.*'")
+
+            fields_to_unnest_objs = [Path(p) if isinstance(p, str) else p for p in fields_to_unnest_list_raw]
+            unnested_map = self._transform_paths_for_unnest_spec(source_array_path_obj, fields_to_unnest_objs)
+            final_path_node_map.update(unnested_map)
+
+            parent_path = source_array_path_obj.get_parent_path()
+            force_arr_paths.add(parent_path)
+
+            wildcard_prefix = source_array_path_obj.get_parts()
+            for p in all_original_paths_flat:
+                parts = p.get_parts()
+                if parts[:len(wildcard_prefix)] == wildcard_prefix:
+                    all_paths_to_exclude.add(p)
+
+        for p in all_original_paths_flat:
+            if p not in all_paths_to_exclude and p not in final_path_node_map:
+                node = self._traverse_path(p)
+                if node:
+                    final_path_node_map[p] = node
+
+        result_guide = self._rebuild_guide_for_unnest(
+            final_path_node_map,
+            force_arr_paths=force_arr_paths
+        )
+        result_guide.total_docs = self.total_docs
+        return result_guide
+
+
+    def _transform_paths_for_unnest_spec(self, source_array_path_obj, fields_to_unnest_list_objs):
+        """
+        Transforms nested paths under a wildcard path (e.g., 'items.*') into flattened paths
+        (e.g., 'items.qty') for the fields specified.
+
+        Args:
+            source_array_path_obj (Path): Path object ending in '*' indicating the array root.
+            fields_to_unnest_list_objs (list of Path): Relative paths within the array elements to unnest.
+
+        Returns:
+            dict[Path, Node]: Mapping of new flattened paths to their corresponding nodes in the schema.
+        """
+
+        path_node_map = {}
+        wildcard_parts = source_array_path_obj.get_parts()
+        if not wildcard_parts or wildcard_parts[-1] != "*":
+            raise ValueError(f"Expected array path to end with '*', got: {source_array_path_obj}")
+
+        all_leaf_paths = self._gather_paths_for_unnest(self.root)
+        wildcard_len = len(wildcard_parts)
+
+        for leaf_path in all_leaf_paths:
+            leaf_parts = leaf_path.get_parts()
+            if leaf_parts[:wildcard_len] != wildcard_parts:
+                continue
+
+            relative_parts = leaf_parts[wildcard_len:]
+            relative_path = Path(".".join(relative_parts)) if relative_parts else Path("")
+
+            if not fields_to_unnest_list_objs or any(relative_path.starts_with(f) for f in fields_to_unnest_list_objs):
+                base_parts = wildcard_parts[:-1]
+                new_path = Path(".".join(base_parts + relative_parts))
+
+                node = self._traverse_path(leaf_path)
+                if node:
+                    path_node_map[new_path] = node
+
+        return path_node_map
+
+
+    def _rebuild_guide_for_unnest(self, path_node_map, force_arr_paths=None):
+        """
+        Rebuilds a new schema guide from the given path-to-node map, forcing array types
+        on specific paths if necessary.
+
+        Args:
+            path_node_map (dict[Path, Node]): Flat map of paths and their schema nodes.
+            force_arr_paths (set of Path): Any path that should be marked as an array level.
+
+        Returns:
+            DataGuidePath: A new schema tree rebuilt from the flattened structure.
+        """
+
+        new_guide = DataGuidePath()
+        force_arr_paths = set(force_arr_paths or [])
+
+        for path_obj in sorted(path_node_map.keys(), key=str):
+            source_node_for_leaf = path_node_map[path_obj]
+            current_target_node = new_guide.root
+            parts = path_obj.get_parts()
+
+            for i, part in enumerate(parts):
+                if part not in current_target_node.children:
+                    current_target_node.children[part] = Node()
+
+                is_leaf = (i == len(parts) - 1)
+                path_so_far = Path(".".join(parts[:i + 1]))
+
+                if not is_leaf:
+                    next_part = parts[i + 1]
+                    if next_part == "*" or path_so_far in force_arr_paths:
+                        current_target_node.counters["arr"] = 1
+                    elif current_target_node.counters["arr"] == 0:
+                        current_target_node.counters["obj"] = 1
+
+                current_target_node = current_target_node.children[part]
+
+            current_target_node.counters = source_node_for_leaf.counters.copy()
+
+        new_guide._ensure_root_obj()
+        return new_guide
+
+
+    def _gather_paths_for_unnest(self, node, current_path=None):
+        """
+        Recursively collects all leaf paths in the schema, starting from 'root',
+        to support unnesting logic.
+
+        Args:
+            node (Node): The current schema node being traversed.
+            current_path (Path): The path built up so far during recursion.
+
+        Returns:
+            list[Path]: All leaf paths found in the schema.
+        """
+
+        if current_path is None:
+            current_path = Path("root")
+
+        paths = []
+        if not node.children:
+            paths.append(current_path)
+        for key, child in node.children.items():
+            paths.extend(self._gather_paths_for_unnest(child, current_path.append(key)))
+        return paths
+
+        
+
+        
