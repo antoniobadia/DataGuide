@@ -1126,7 +1126,6 @@ class DataGuidePath:
         
         return new_guide # Removed report output
 
-    # This project works as intended 07.10.2025 it updates the total_docs to account for only paths that start at the root
     def project(self, paths_to_search_for, new_root_key=None):
         """
         Return a new DataGuide with only paths that contain any of the specified
@@ -1606,12 +1605,15 @@ class DataGuidePath:
 
             parent_path = source_array_path_obj.get_parent_path()
             force_arr_paths.add(parent_path)
+            all_paths_to_exclude.add(parent_path)  # prevent adding passed in parameter after unnest
 
             wildcard_prefix = source_array_path_obj.get_parts()
             for p in all_original_paths_flat:
                 parts = p.get_parts()
                 if parts[:len(wildcard_prefix)] == wildcard_prefix:
                     all_paths_to_exclude.add(p)
+            
+            
 
         for p in all_original_paths_flat:
             if p not in all_paths_to_exclude and p not in final_path_node_map:
@@ -1658,7 +1660,7 @@ class DataGuidePath:
 
             if not fields_to_unnest_list_objs or any(relative_path.starts_with(f) for f in fields_to_unnest_list_objs):
                 base_parts = wildcard_parts[:-1]
-                new_path = Path(".".join(base_parts + relative_parts))
+                new_path = Path(".".join(relative_parts))
 
                 node = self._traverse_path(leaf_path)
                 if node:
