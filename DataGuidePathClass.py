@@ -166,6 +166,7 @@ class DataGuidePath:
         """
         Initialization method for DataGuide
         """
+        self._array_lengths = {}
         #Create Node object for root
         self.root = Node()
         #Initialize document counter
@@ -241,20 +242,57 @@ class DataGuidePath:
        #return boolean based on if input string is date
        return bool(re.match(r"\d{4}-\d{2}\d{2}", s))
     
+    # modified to keept track of list lengths
     def insert_document(self, doc):
-        """
-        Method used to insert a document into data guide
-        """
-        #Check if JSON file contains multiple documents
+        if not hasattr(self, "_array_lengths"):
+            self._array_lengths = {}
+
         if isinstance(doc, list):
-            #Iterate over documents in file
             for d in doc:
                 self.total_docs += 1
+                self._track_array_lengths(d)
                 self._insert_value(self.root, d)
-        #If single document
         elif isinstance(doc, dict):
             self.total_docs += 1
+            self._track_array_lengths(doc)
             self._insert_value(self.root, doc)
+
+    def _track_array_lengths(self, doc):
+        """
+        For each array field, record its length per document.
+        Includes 0 for empty or None to support conservative expansion.
+        """
+        from collections import deque
+
+        queue = deque([(Path(""), doc)])
+
+        while queue:
+            current_path, val = queue.popleft()
+            if isinstance(val, dict):
+                for k, v in val.items():
+                    queue.append((current_path.append(k), v))
+            elif isinstance(val, list):
+                self._array_lengths.setdefault(str(current_path), []).append(len(val))
+                for i in val:
+                    queue.append((current_path.append("*"), i))
+            elif val is None:
+                self._array_lengths.setdefault(str(current_path), []).append(0)
+
+
+    def _iter_all_paths(self):
+        """
+        Yields all (Path, Node) pairs in the guide.
+        Useful for operations like scaling counters or printing.
+
+        Example: for path 'root.customer.name', yields:
+            (Path('customer.name'), <GuideNode>)
+        """
+        def _walk(node, path):
+            yield path, node
+            for key, child in node.children.items():
+                yield from _walk(child, path.append(key))
+
+        yield from _walk(self.root, Path(""))
 
     # Here value can be an entire document, a nested sub-object , a list, or a primitive value input through recursion
     def _insert_value(self, node, value): 
@@ -1561,23 +1599,8 @@ class DataGuidePath:
         new_guide.total_docs = self.total_docs
         return new_guide
 
+
     def unnest_schema(self, unnest_specs=None):
-        """
-        Flattens nested array fields in the schema based on the given unnest specifications.
-
-        Args:
-            unnest_specs (list of tuples): Each tuple has:
-                - A path ending in '.*' indicating the array to unnest (e.g., 'items.*')
-                - A list of relative field paths to extract (e.g., ['qty', 'price']).
-                If the list is empty, all fields inside the array are included.
-
-        Returns:
-            DataGuidePath: A new schema guide with the specified paths unnested.
-
-        Example:
-            unnest_schema([("items.*", ["qty", "price"])])
-            → flattens 'items.*.qty' and 'items.*.price' into 'items.qty' and 'items.price'
-        """
         if not unnest_specs:
             return self
 
@@ -1595,27 +1618,26 @@ class DataGuidePath:
         _collect_all_paths(self.root, Path(""))
 
         for source_array_path_raw, fields_to_unnest_list_raw in unnest_specs:
-            source_array_path_obj = Path(source_array_path_raw) if isinstance(source_array_path_raw, str) else source_array_path_raw
+            source_array_path_obj = Path(source_array_path_raw)
             if not source_array_path_obj.endswith("*"):
-                raise ValueError(f"source_array_path '{source_array_path_obj}' must end with '.*'")
+                raise ValueError(f"Unnest path must end in '*': {source_array_path_obj}")
 
-            fields_to_unnest_objs = [Path(p) if isinstance(p, str) else p for p in fields_to_unnest_list_raw]
+            fields_to_unnest_objs = [Path(p) for p in fields_to_unnest_list_raw]
             unnested_map = self._transform_paths_for_unnest_spec(source_array_path_obj, fields_to_unnest_objs)
             final_path_node_map.update(unnested_map)
 
             parent_path = source_array_path_obj.get_parent_path()
             force_arr_paths.add(parent_path)
-            all_paths_to_exclude.add(parent_path)  # prevent adding passed in parameter after unnest
+            all_paths_to_exclude.add(parent_path)
 
             wildcard_prefix = source_array_path_obj.get_parts()
             for p in all_original_paths_flat:
-                parts = p.get_parts()
-                if parts[:len(wildcard_prefix)] == wildcard_prefix:
+                if p.get_parts()[:len(wildcard_prefix)] == wildcard_prefix:
                     all_paths_to_exclude.add(p)
-            
-            
 
         for p in all_original_paths_flat:
+            if str(p) == "":
+                continue  # ✅ skip root
             if p not in all_paths_to_exclude and p not in final_path_node_map:
                 node = self._traverse_path(p)
                 if node:
@@ -1625,10 +1647,37 @@ class DataGuidePath:
             final_path_node_map,
             force_arr_paths=force_arr_paths
         )
-        result_guide.total_docs = self.total_docs
+
+        # --- Conservative document expansion ---
+        # --- Conservative document expansion ---
+        expanded_count = 0
+        for source_array_path_raw, _ in unnest_specs:
+            parent_path = Path(source_array_path_raw).get_parent_path()
+            lengths = self._array_lengths.get(str(parent_path), [])
+            if lengths:
+                expanded_count += sum(max(1, l) for l in lengths)
+            else:
+                expanded_count += self.total_docs  # fallback
+
+
+        result_guide.total_docs = expanded_count
+
+        # --- Scale original fields only ---
+        flattened_paths_from_array = set(final_path_node_map) - set(all_original_paths_flat)
+
+        if self.total_docs > 0 and expanded_count > 0:
+            scale_factor = expanded_count / self.total_docs
+            for path in final_path_node_map:
+                if path in flattened_paths_from_array:
+                    continue  # skip new unnested paths
+                node = result_guide._traverse_path(path)
+                if node:
+                    for dtype in node.counters:
+                        node.counters[dtype] = int(round(node.counters[dtype] * scale_factor))
+
         return result_guide
-
-
+ 
+  
     def _transform_paths_for_unnest_spec(self, source_array_path_obj, fields_to_unnest_list_objs):
         """
         Transforms nested paths under a wildcard path (e.g., 'items.*') into flattened paths
@@ -1668,31 +1717,21 @@ class DataGuidePath:
 
         return path_node_map
 
-
     def _rebuild_guide_for_unnest(self, path_node_map, force_arr_paths=None):
-        """
-        Rebuilds a new schema guide from the given path-to-node map, forcing array types
-        on specific paths if necessary.
-
-        Args:
-            path_node_map (dict[Path, Node]): Flat map of paths and their schema nodes.
-            force_arr_paths (set of Path): Any path that should be marked as an array level.
-
-        Returns:
-            DataGuidePath: A new schema tree rebuilt from the flattened structure.
-        """
-
         new_guide = DataGuidePath()
         force_arr_paths = set(force_arr_paths or [])
 
         for path_obj in sorted(path_node_map.keys(), key=str):
-            source_node_for_leaf = path_node_map[path_obj]
-            current_target_node = new_guide.root
+            if str(path_obj) == "":
+                continue  # ✅ skip root — handled manually in unnest_schema
+
+            source_node = path_node_map[path_obj]
+            current_node = new_guide.root
             parts = path_obj.get_parts()
 
             for i, part in enumerate(parts):
-                if part not in current_target_node.children:
-                    current_target_node.children[part] = Node()
+                if part not in current_node.children:
+                    current_node.children[part] = Node()
 
                 is_leaf = (i == len(parts) - 1)
                 path_so_far = Path(".".join(parts[:i + 1]))
@@ -1700,13 +1739,11 @@ class DataGuidePath:
                 if not is_leaf:
                     next_part = parts[i + 1]
                     if next_part == "*" or path_so_far in force_arr_paths:
-                        current_target_node.counters["arr"] = 1
-                    elif current_target_node.counters["arr"] == 0:
-                        current_target_node.counters["obj"] = 1
+                        current_node.counters["arr"] = 1
 
-                current_target_node = current_target_node.children[part]
+                current_node = current_node.children[part]
 
-            current_target_node.counters = source_node_for_leaf.counters.copy()
+            current_node.counters = source_node.counters.copy()
 
         new_guide._ensure_root_obj()
         return new_guide
