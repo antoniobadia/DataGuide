@@ -242,20 +242,33 @@ class DataGuidePath:
        #return boolean based on if input string is date
        return bool(re.match(r"\d{4}-\d{2}\d{2}", s))
     
-    # modified to keept track of list lengths
-    def insert_document(self, doc):
+    # modified to keep track of list lengths
+    # Modified again to unpack nested lists
+    def insert_document(self, *docs):
+        """
+        Insert one or more documents. Recursively unpacks nested lists.
+        Example:
+            insert_document(doc1, doc2)
+            insert_document([doc1, doc2])  # also works
+            insert_document(doc1, [doc2, doc3])  # mixed
+        """
         if not hasattr(self, "_array_lengths"):
             self._array_lengths = {}
 
-        if isinstance(doc, list):
-            for d in doc:
+        def _handle(doc):
+            if isinstance(doc, dict):
                 self.total_docs += 1
-                self._track_array_lengths(d)
-                self._insert_value(self.root, d)
-        elif isinstance(doc, dict):
-            self.total_docs += 1
-            self._track_array_lengths(doc)
-            self._insert_value(self.root, doc)
+                self._track_array_lengths(doc)
+                self._insert_value(self.root, doc)
+            elif isinstance(doc, list):
+                for item in doc:
+                    _handle(item)
+            else:
+                raise ValueError(f"Unsupported document type: {type(doc)}. Expected dict or list.")
+
+        for doc in docs:
+            _handle(doc)
+
 
     def _track_array_lengths(self, doc):
         """
@@ -813,6 +826,331 @@ class DataGuidePath:
         return new_node
 
 
+
+    def rename(self, old_path, new_path, inplace=False):
+        """
+        Rename all paths that start with `old_path` by replacing that prefix with `new_path`.
+
+        Args:
+            old_path (str or Path): path prefix to replace (e.g. "root.a" or "a.b")
+            new_path (str or Path): replacement prefix (e.g. "root.a2" or "a2.b")
+            inplace (bool): if True modify this DataGuidePath and return self,
+                            if False (default) return a new DataGuidePath.
+
+        Returns:
+            DataGuidePath: the renamed DataGuidePath (self if inplace=True, else new object)
+
+        Raises:
+            TypeError: if path args are not str or Path.
+            ValueError: if rename would cause path collisions (two original paths mapping to same target).
+        """
+        # Normalize inputs to Path objects
+        if isinstance(old_path, str):
+            old_p = Path(old_path)
+        elif isinstance(old_path, Path):
+            old_p = old_path
+        else:
+            raise TypeError("old_path must be a string or Path")
+
+        if isinstance(new_path, str):
+            new_p = Path(new_path)
+        elif isinstance(new_path, Path):
+            new_p = new_path
+        else:
+            raise TypeError("new_path must be a string or Path")
+        
+        if self.search(str(new_p)) and old_p != new_p:
+            raise ValueError(f"Rename would cause a collision: '{str(new_p)}' already exists in the guide.")
+
+        # Gather all paths (leaf and intermediate) from the guide
+        all_paths = set()
+        def _collect_all_paths_recursive(node, current_path_obj):
+            if str(current_path_obj) != "":
+                all_paths.add(current_path_obj)
+            for key, child in node.children.items():
+                _collect_all_paths_recursive(child, current_path_obj.append(key))
+        _collect_all_paths_recursive(self.root, Path(""))
+        
+        # Build mapping from transformed_path -> source_node
+        transformed_map = {}
+        renamed_pairs = []  # tuples (old_str, new_str) for report
+        
+        # This set will track which original paths have been renamed, to avoid adding them as-is later.
+        renamed_original_paths = set()
+
+        # First pass: map all paths to their new name
+        for orig_path_obj in all_paths:
+            src_node = self._traverse_path(orig_path_obj)
+            if src_node is None:
+                continue
+
+            if orig_path_obj.starts_with(old_p):
+                suffix_parts = orig_path_obj.get_parts()[len(old_p.get_parts()):]
+                new_parts = new_p.get_parts() + suffix_parts
+                transformed_path_obj = Path(".".join(new_parts)) if new_parts else Path("")
+                
+                # Check for collisions during the mapping process as well
+                if transformed_path_obj in transformed_map and transformed_map[transformed_path_obj] != src_node:
+                    raise ValueError(f"Rename would create a collision: '{str(transformed_path_obj)}' from '{str(orig_path_obj)}' and another path.")
+                
+                transformed_map[transformed_path_obj] = src_node
+                renamed_pairs.append((str(orig_path_obj), str(transformed_path_obj)))
+                renamed_original_paths.add(orig_path_obj)
+
+        # Second pass: add original paths that were not renamed
+        for orig_path_obj in all_paths:
+            if orig_path_obj not in renamed_original_paths:
+                # Add only if not already in the map 
+                if orig_path_obj not in transformed_map:
+                    src_node = self._traverse_path(orig_path_obj)
+                    if src_node:
+                        transformed_map[orig_path_obj] = src_node
+        
+        # If nothing matched, return copy 
+        if not renamed_pairs:
+            if inplace:
+                return self
+            else:
+                new_guide = self._rebuild_guide_from_path_node_map(transformed_map)
+                new_guide.total_docs = self.total_docs
+                return new_guide
+
+        # Rebuild a new guide from the transformed_map
+        new_guide = self._rebuild_guide_from_path_node_map(transformed_map)
+        new_guide.total_docs = self.total_docs
+
+        # Produce user feedback (up to 10 renamed)
+        n_renamed = len(renamed_pairs)
+        preview = renamed_pairs[:10]
+        msg_lines = [f"Renamed {n_renamed} path(s)."]
+        for old_s, new_s in preview:
+            msg_lines.append(f"  {old_s} -> {new_s}")
+        if n_renamed > 10:
+            msg_lines.append(f"  ... (+{n_renamed-10} more)")
+
+        report = "\n".join(msg_lines)
+        print(report)
+
+        if inplace:
+            self.root = new_guide.root
+            self.total_docs = new_guide.total_docs
+            return self
+        else:
+            return new_guide
+
+
+    def _get_top_level_segments(self):
+        """
+        Return a set of top-level keys present in the data guide (as Path objects).
+        """
+        tops = set()
+        for p in self._gather_paths(self.root):
+            parts = p.get_parts()
+            if parts:
+                tops.add(parts[0])
+        return tops
+
+    def _find_top_level_conflicts(self, other):
+        """
+        Return a sorted list of conflicting top-level key names (strings) between self and other.
+        """
+        if not isinstance(other, DataGuidePath):
+            raise TypeError("other must be a DataGuidePath")
+        s_tops = {t for t in self._get_top_level_segments()}
+        o_tops = {t for t in other._get_top_level_segments()}
+        conflicts = sorted(list(s_tops & o_tops))
+        return conflicts
+
+    def _auto_rename_top_level_conflicts(self, other, rename_prefix="__r"):
+        """
+        Make a copy of `other` and rename any top-level segments that conflict with self.
+        Returns (other_copy, rename_map) where rename_map maps old_top -> new_top.
+        """
+        # copy other via dict roundtrip (safe shallow clone)
+        other_copy = DataGuidePath.from_dict(other.to_dict())
+
+        conflicts = self._find_top_level_conflicts(other_copy)
+        used = set(self._get_top_level_segments())  # names already used on left
+
+        rename_map = {}
+        for top in conflicts:
+            # generate candidate name by appending prefix + index until unique
+            i = 1
+            candidate = f"{top}{rename_prefix}{i}"
+            while candidate in used:
+                i += 1
+                candidate = f"{top}{rename_prefix}{i}"
+            used.add(candidate)
+            # perform rename: we must rename top-level prefix `top` -> candidate
+            old_prefix = top
+            new_prefix = candidate
+
+            # Build mapping of leaf paths to nodes for other_copy where prefix replaced
+            all_leaf_paths = other_copy._gather_paths(other_copy.root)
+            path_node_map = {}
+            for leaf in all_leaf_paths:
+                node = other_copy._traverse_path(leaf)
+                if node is None:
+                    continue
+                parts = leaf.get_parts()
+                if parts and parts[0] == old_prefix:
+                    new_parts = [new_prefix] + parts[1:]
+                    new_p = Path(".".join(new_parts))
+                else:
+                    new_p = leaf
+                path_node_map[new_p] = node
+
+            # rebuild other_copy from updated path map
+            other_copy = other_copy._rebuild_guide_from_path_node_map(path_node_map)
+            other_copy.total_docs = other.total_docs  # keep original doc count
+            rename_map[old_prefix] = new_prefix
+
+        return other_copy, rename_map
+
+
+    def cartesian_product(self, other, rename_conflicts=False, rename_prefix="__r"):
+        """
+        Cartesian product of self and other.
+
+        - If rename_conflicts=False (default): raises ValueError listing up to 10 conflicting top-level keys.
+        - If rename_conflicts=True: auto-renames conflicting top-level keys on a copy of `other`
+          using rename_prefix (default "__r"), reports the renames, then computes CP.
+
+        Returns a new DataGuidePath.
+        """
+        if not isinstance(other, DataGuidePath):
+            raise TypeError("other must be a DataGuidePath")
+        if not isinstance(rename_conflicts, bool):
+            raise TypeError("rename_conflicts must be a boolean value.")
+
+
+        # detect top-level conflicts (list of strings)
+        conflicts = self._find_top_level_conflicts(other)
+
+        if conflicts and not rename_conflicts:
+            # prepare message with up to 10 conflicts
+            shown = conflicts[:10]
+            more = len(conflicts) - len(shown)
+            msg_lines = [f"Conflicting top-level keys detected ({len(conflicts)}):"]
+            for c in shown:
+                msg_lines.append(f"  - {c}")
+            if more > 0:
+                msg_lines.append(f"  ... and {more} more (showing first 10).")
+
+            msg_lines.append("\nTo resolve this and rename path(s), set rename_conflicts=True.")
+            raise ValueError("\n".join(msg_lines))
+
+        # If renaming requested, create a renamed copy of other
+        other_for_cp = other
+        rename_map = {}
+        if conflicts and rename_conflicts:
+            other_for_cp, rename_map = self._auto_rename_top_level_conflicts(other, rename_prefix=rename_prefix)
+            # Inform the user which top-levels were renamed
+            if rename_map:
+                info_lines = ["Auto-renamed conflicting top-level keys:"]
+                for oldt, newt in rename_map.items():
+                    info_lines.append(f"  - {oldt} -> {newt}")
+                print("\n".join(info_lines))
+
+        # Perform the CP operation:
+        result = DataGuidePath()
+        result.total_docs = self.total_docs * other_for_cp.total_docs
+
+        # We'll use a single pass with a recursive helper to build the new guide
+        result.root = self._cartesian_product_nodes(self.root, self.total_docs, other_for_cp.root, other_for_cp.total_docs)
+        result._ensure_root_obj()
+        return result
+    
+    def _rebuild_guide_from_map(self, path_node_map):
+        """
+        Rebuilds a new schema guide from the given path-to-node map.
+        This helper correctly sets obj/arr counters for all intermediate nodes.
+        """
+        new_guide = DataGuidePath()
+        
+        temp_map = {path_obj: Node.from_dict(source_node.to_dict()) for path_obj, source_node in path_node_map.items()}
+
+        for path_obj in sorted(temp_map.keys(), key=str):
+            source_node = temp_map[path_obj]
+            current_target_node = new_guide.root
+            parts = path_obj.get_parts()
+
+            for i, part in enumerate(parts):
+                if part not in current_target_node.children:
+                    current_target_node.children[part] = Node()
+
+                if i == len(parts) - 1:
+                    current_target_node.children[part].counters = source_node.counters.copy()
+                
+                if i < len(parts) - 1:
+                    next_part = parts[i + 1]
+                    if next_part == '*' and current_target_node.children[part].counters.get('arr', 0) == 0:
+                        current_target_node.children[part].counters['arr'] = 1
+                    elif next_part != '*' and current_target_node.children[part].counters.get('obj', 0) == 0:
+                        current_target_node.children[part].counters['obj'] = 1
+
+                current_target_node = current_target_node.children[part]
+        
+        return new_guide
+
+    def _cartesian_product_nodes(self, node1, count1, node2, count2):
+        """
+        Helper to recursively merge and scale counters from two nodes for a cartesian product.
+        """
+        new_node = Node()
+
+        all_dtypes = set(node1.counters.keys()) | set(node2.counters.keys())
+
+        for dtype in all_dtypes:
+            count1_val = node1.counters.get(dtype, 0)
+            count2_val = node2.counters.get(dtype, 0)
+
+            # For a cartesian product of schemaless documents,
+            # a field present in one doc but not the other still exists in the result.
+            # The count is the sum of their presence.
+            if count1_val > 0 and count2_val > 0:
+                # If both nodes have the data type, multiply their counts
+                new_node.counters[dtype] = count1_val * count2_val
+            elif count1_val > 0:
+                # If only node1 has it, it gets scaled by the count of node2
+                new_node.counters[dtype] = count1_val * count2
+            elif count2_val > 0:
+                # If only node2 has it, it gets scaled by the count of node1
+                new_node.counters[dtype] = count2_val * count1
+
+        # Merge children recursively
+        all_keys = set(node1.children.keys()) | set(node2.children.keys())
+
+        for key in all_keys:
+            child1 = node1.children.get(key)
+            child2 = node2.children.get(key)
+
+            if child1 and child2:
+                # Both children exist, so we perform a recursive cartesian product
+                new_node.children[key] = self._cartesian_product_nodes(child1, count1, child2, count2)
+            elif child1:
+                # This subtree only exists in the first node, so it should be scaled by the count of the second node.
+                new_node.children[key] = self._scale_subtree(child1, count2)
+            elif child2:
+                # This subtree only exists in the second node, so it should be scaled by the count of the first node.
+                new_node.children[key] = self._scale_subtree(child2, count1)
+
+        return new_node
+
+
+    def _scale_subtree(self, node, multiplier):
+        """
+        Recursively clones and scales all counters in the subtree.
+        """
+        new_node = Node()
+        for dtype, count in node.counters.items():
+            new_node.counters[dtype] = count * multiplier
+
+        for key, child in node.children.items():
+            new_node.children[key] = self._scale_subtree(child, multiplier)
+
+        return new_node
+
     def _rebuild_guide_from_path_node_map(self, path_node_map):
         """
         Helper to reconstruct a new DataGuidePath's tree from a map of
@@ -838,9 +1176,6 @@ class DataGuidePath:
                 
                 # Logic to set obj/arr for parents based on structural presence.
                 # If a node now has children, it's an object (or contains an array if next is '*').
-                # Set obj/arr counter to 1 if it means it became a parent.
-                # This signifies structural integrity, but not sum of original occurrences.
-                # Start with if it's not the leaf itself
                 if i < len(parts) - 1:
                     next_part = parts[i + 1]
 
@@ -862,6 +1197,7 @@ class DataGuidePath:
         new_guide._ensure_root_obj()
         return new_guide
     
+
     def card(self, path=None):
         """
         Method to extract cardinality from data guide.
