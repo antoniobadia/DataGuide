@@ -532,7 +532,8 @@ class DataGuidePath:
         if all(v == 0 for v in new_node.counters.values()) and not new_node.children:
             return None
         return new_node
-    
+
+
     def _clone_subtree(self, node):
         """
         Helper method to copy an entire subtree of nodes when only one child
@@ -547,6 +548,43 @@ class DataGuidePath:
             copy.children[key] = self._clone_subtree(child)
         return copy
     
+    # Helper: get paths in other but not in self
+    def _paths_not_in_self(self, other):
+        self_paths = set(self.list_paths())
+        other_paths = set(other.list_paths())
+        return list(other_paths - self_paths)
+
+    # Helper: get total documents for a path
+    def _get_path_counter(self, path):
+        node = self._get_node_by_path(path)
+        if node:
+            return node.counters.get('obj', 0)
+        return 0
+
+    # Helper: traverse paths in DataGuide
+    def list_paths(self):
+        paths = []
+
+        def traverse(node, current_path):
+            for key, child in node.children.items():
+                full_path = f"{current_path}.{key}" if current_path else key
+                paths.append(full_path)
+                traverse(child, full_path)
+
+        traverse(self.root, "")
+        return paths
+
+    # Helper: get node by path string
+    def _get_node_by_path(self, path_str):
+        parts = path_str.split(".")
+        node = self.root
+        for p in parts:
+            node = node.children.get(p)
+            if node is None:
+                return None
+        return node
+
+
     def _sum_counters(self, node):
         """
         Method to return the sum of counters for path or data guide
@@ -778,6 +816,236 @@ class DataGuidePath:
             "min_docs_est impacted": getattr(self, "min_docs_est", None),
         }
 
+    def unnest_schema(self, unnest_specs=None):
+        if not unnest_specs:
+            return self
+
+        final_path_node_map = {}
+        all_original_paths_flat = set()
+        all_paths_to_exclude = set()
+        force_arr_paths = set()
+
+        def _collect_all_paths(node, current_path_obj):
+            if str(current_path_obj) != "":
+                all_original_paths_flat.add(current_path_obj)
+            for key, child in node.children.items():
+                _collect_all_paths(child, current_path_obj.append(key))
+
+        _collect_all_paths(self.root, Path(""))
+
+        for source_array_path_raw, fields_to_unnest_list_raw in unnest_specs:
+            source_array_path_obj = Path(source_array_path_raw)
+            if not source_array_path_obj.endswith("*"):
+                raise ValueError(f"Unnest path must end in '*': {source_array_path_obj}")
+
+            fields_to_unnest_objs = [Path(p) for p in fields_to_unnest_list_raw]
+            unnested_map = self._transform_paths_for_unnest_spec(source_array_path_obj, fields_to_unnest_objs)
+            final_path_node_map.update(unnested_map)
+
+            parent_path = source_array_path_obj.get_parent_path()
+            force_arr_paths.add(parent_path)
+            all_paths_to_exclude.add(parent_path)
+
+            wildcard_prefix = source_array_path_obj.get_parts()
+            for p in all_original_paths_flat:
+                if p.get_parts()[:len(wildcard_prefix)] == wildcard_prefix:
+                    all_paths_to_exclude.add(p)
+
+        for p in all_original_paths_flat:
+            if str(p) == "":
+                continue  # ✅ skip root
+            if p not in all_paths_to_exclude and p not in final_path_node_map:
+                node = self._traverse_path(p)
+                if node:
+                    final_path_node_map[p] = node
+
+        result_guide = self._rebuild_guide_for_unnest(
+            final_path_node_map,
+            force_arr_paths=force_arr_paths
+        )
+
+        # --- Conservative document expansion ---
+        # --- Conservative document expansion ---
+        expanded_count = 0
+        for source_array_path_raw, _ in unnest_specs:
+            parent_path = Path(source_array_path_raw).get_parent_path()
+            lengths = self._array_lengths.get(str(parent_path), [])
+            if lengths:
+                expanded_count += sum(max(1, l) for l in lengths)
+            else:
+                expanded_count += self.total_docs  # fallback
+
+
+        result_guide.total_docs = expanded_count
+
+        # --- Scale original fields only ---
+        flattened_paths_from_array = set(final_path_node_map) - set(all_original_paths_flat)
+
+        if self.total_docs > 0 and expanded_count > 0:
+            scale_factor = expanded_count / self.total_docs
+            for path in final_path_node_map:
+                if path in flattened_paths_from_array:
+                    continue  # skip new unnested paths
+                node = result_guide._traverse_path(path)
+                if node:
+                    for dtype in node.counters:
+                        node.counters[dtype] = int(round(node.counters[dtype] * scale_factor))
+
+        return result_guide
+ 
+    def _transform_paths_for_unnest_spec(self, source_array_path_obj, fields_to_unnest_list_objs):
+        """
+        Transforms nested paths under a wildcard path (e.g., 'items.*') into flattened paths
+        (e.g., 'items.qty') for the fields specified.
+
+        Args:
+            source_array_path_obj (Path): Path object ending in '*' indicating the array root.
+            fields_to_unnest_list_objs (list of Path): Relative paths within the array elements to unnest.
+
+        Returns:
+            dict[Path, Node]: Mapping of new flattened paths to their corresponding nodes in the schema.
+        """
+
+        path_node_map = {}
+        wildcard_parts = source_array_path_obj.get_parts()
+        if not wildcard_parts or wildcard_parts[-1] != "*":
+            raise ValueError(f"Expected array path to end with '*', got: {source_array_path_obj}")
+
+        all_leaf_paths = self._gather_paths_for_unnest(self.root)
+        wildcard_len = len(wildcard_parts)
+
+        for leaf_path in all_leaf_paths:
+            leaf_parts = leaf_path.get_parts()
+            if leaf_parts[:wildcard_len] != wildcard_parts:
+                continue
+
+            relative_parts = leaf_parts[wildcard_len:]
+            relative_path = Path(".".join(relative_parts)) if relative_parts else Path("")
+
+            if not fields_to_unnest_list_objs or any(relative_path.starts_with(f) for f in fields_to_unnest_list_objs):
+                base_parts = wildcard_parts[:-1]
+                new_path = Path(".".join(relative_parts))
+
+                node = self._traverse_path(leaf_path)
+                if node:
+                    path_node_map[new_path] = node
+
+        return path_node_map
+
+    def _rebuild_guide_for_unnest(self, path_node_map, force_arr_paths=None):
+        new_guide = DataGuidePath()
+        force_arr_paths = set(force_arr_paths or [])
+
+        for path_obj in sorted(path_node_map.keys(), key=str):
+            if str(path_obj) == "":
+                continue  # ✅ skip root — handled manually in unnest_schema
+
+            source_node = path_node_map[path_obj]
+            current_node = new_guide.root
+            parts = path_obj.get_parts()
+
+            for i, part in enumerate(parts):
+                if part not in current_node.children:
+                    current_node.children[part] = Node()
+
+                is_leaf = (i == len(parts) - 1)
+                path_so_far = Path(".".join(parts[:i + 1]))
+
+                if not is_leaf:
+                    next_part = parts[i + 1]
+                    if next_part == "*" or path_so_far in force_arr_paths:
+                        current_node.counters["arr"] = 1
+
+                current_node = current_node.children[part]
+
+            current_node.counters = source_node.counters.copy()
+
+        new_guide._ensure_root_obj()
+        return new_guide
+
+    def _gather_paths_for_unnest(self, node, current_path=None):
+        """
+        Recursively collects all leaf paths in the schema, starting from 'root',
+        to support unnesting logic.
+
+        Args:
+            node (Node): The current schema node being traversed.
+            current_path (Path): The path built up so far during recursion.
+
+        Returns:
+            list[Path]: All leaf paths found in the schema.
+        """
+
+        if current_path is None:
+            current_path = Path("root")
+
+        paths = []
+        if not node.children:
+            paths.append(current_path)
+        for key, child in node.children.items():
+            paths.extend(self._gather_paths_for_unnest(child, current_path.append(key)))
+        return paths
+
+    def _apply_aggregations(self, aggregation_specs):
+        """
+        Handles list of (fname, path, newpath) aggregation specs.
+        Returns a new DataGuidePath with each aggregation result placed at `newpath`.
+        """
+        allowed_funcs = {"sum", "count", "avg", "min", "max"}
+        path_node_map = {}
+
+        for spec in aggregation_specs:
+            if len(spec) != 3:
+                raise ValueError("Each aggregation spec must be (fname, source_path, newpath)")
+
+            fname, source_path_raw, target_path_raw = spec
+
+            if fname not in allowed_funcs:
+                raise ValueError(f"Unsupported aggregation function: {fname}")
+
+            source_path = Path(source_path_raw)
+            target_path = Path(target_path_raw)
+
+            node = self._traverse_path(source_path)
+            if not node:
+                print(f"Skipping aggregation: {source_path} not found in guide.")
+                continue
+
+            # Create the output node
+            agg_node = Node()
+
+            # Determine output type
+            if fname == "count":
+                agg_node.counters["int"] = 1  # count is always int
+            elif fname in {"sum", "avg"}:
+                if node.counters.get("float", 0) or node.counters.get("int", 0):
+                    agg_node.counters["float"] = 1
+                else:
+                    print(f"Skipping aggregation: {fname} cannot apply to non-numeric {source_path}")
+                    continue
+            elif fname in {"min", "max"}:
+                found_type = None
+                for t in ["int", "float", "str", "date"]:
+                    if node.counters.get(t, 0):
+                        found_type = t
+                        break
+                if not found_type:
+                    print(f"Skipping aggregation: {fname} has no valid types for {source_path}")
+                    continue
+                agg_node.counters[found_type] = 1
+
+            path_node_map[target_path] = agg_node
+
+        if not path_node_map:
+            print("No valid aggregation outputs were generated.")
+            return DataGuidePath()
+
+        # Build new guide
+        new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
+        new_guide.total_docs = self.total_docs
+        return new_guide
+        
+
     def union(self, other):
         """
         Method used to union two dataguides, other is a second dataguide
@@ -824,8 +1092,6 @@ class DataGuidePath:
                 # Clone its entire subtree and add to the new node's children
                 new_node.children[key] = self._clone_subtree(child2)
         return new_node
-
-
 
     def rename(self, old_path, new_path, inplace=False):
         """
@@ -937,7 +1203,6 @@ class DataGuidePath:
             return self
         else:
             return new_guide
-
 
     def _get_top_level_segments(self):
         """
@@ -1330,176 +1595,6 @@ class DataGuidePath:
         # Return True if the node is found (path exists), False otherwise
         return node is not None
     
-    def nest_fields(self, parent_path_str, fields_to_nest_list, new_nested_key_name):
-        """
-        Nests a specific list of fields (and their sub-paths) under a new key.
-        The fields in `fields_to_nest_list` must be direct children of `parent_path_str`.
-        
-        Example: nest_fields("root.user", ["address", "contact"], "details")
-        'root.user.address.street' becomes 'root.user.details.address.street'
-        'root.user.name' remains 'root.user.name'
-        
-        Returns a new DataGuidePath object with the transformed schema.
-        
-        Note: 'obj' and 'arr' counters for intermediate nodes in the new guide
-        will reflect structural presence (i.e., at least 1 if they contain children/array elements)
-        rather than summed document occurrences, as the transformation operates on schema, not original documents.
-        Leaf node counters are preserved.
-        """
-        parent_path_obj = Path(parent_path_str)
-        
-        # Convert fields_to_nest_list to a set for efficient lookup
-        fields_to_nest_set = set(fields_to_nest_list)
-
-        path_node_map = {} # Map to store (transformed_path_obj: source_node)
-
-        # Iterate through all leaf paths from the original guide
-        all_original_paths = self._gather_paths(self.root)
-
-        for original_path_obj in all_original_paths:
-            source_node = self._traverse_path(original_path_obj)
-            if source_node is None: continue 
-
-            transformed_path_obj = original_path_obj
-
-            # Check if this original path is under the parent_path_str
-            if original_path_obj.starts_with(parent_path_obj):
-                # Get the part of the path immediately following the parent_path_str
-                # e.g., for original_path_obj="root.user.address.street", parent_path_obj="root.user"
-                # first_segment_after_parent would be "address"
-                parts_after_parent = original_path_obj.get_parts()[len(parent_path_obj.get_parts()):]
-                
-                if parts_after_parent: # Ensure there are parts after the parent path
-                    first_segment_after_parent = parts_after_parent[0]
-
-                    if first_segment_after_parent in fields_to_nest_set:
-                        # This path needs to be nested.
-                        # New path structure: parent_path + new_nested_key + (first_segment_after_parent + rest_of_parts)
-                        transformed_path = parent_path_obj.append(new_nested_key_name)
-                        for part in parts_after_parent: # Includes first_segment_after_parent itself
-                            transformed_path = transformed_path.append(part)
-                        transformed_path_obj = transformed_path
-            
-            path_node_map[transformed_path_obj] = source_node
-        
-        new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
-        new_guide.total_docs = self.total_docs 
-        return new_guide
-
-    def unnest_field(self, parent_path_str, field_to_unnest):
-        """
-        Unnests a specific field, lifting its children directly under its parent.
-        The `field_to_unnest` must be a direct child of `parent_path_str`.
-        
-        Example: unnest_field("root.user", "location")
-        'root.user.location.street' becomes 'root.user.street'
-        'root.user.name' remains 'root.user.name'
-
-        Returns a new DataGuidePath object with the transformed schema.
-        
-        Note: 'obj' and 'arr' counters for intermediate nodes in the new guide
-        will reflect structural presence (i.e., at least 1 if they contain children/array elements)
-        rather than summed document occurrences, as the transformation operates on schema, not original documents.
-        Leaf node counters are preserved.
-        """
-        parent_path_obj = Path(parent_path_str)
-        field_to_unnest_path_obj = parent_path_obj.append(field_to_unnest)
-
-        path_node_map = {} 
-
-        all_original_paths = self._gather_paths(self.root)
-
-        for original_path_obj in all_original_paths:
-            source_node = self._traverse_path(original_path_obj)
-            if source_node is None: continue 
-
-            transformed_path_obj = original_path_obj
-
-            # Check if this original path starts with the field_to_unnest_path_obj (i.e., is a child of it)
-            if original_path_obj.starts_with(field_to_unnest_path_obj):
-                # Get the suffix parts (i.e., parts after the field_to_unnest_path_obj)
-                # e.g., for original_path_obj="root.user.location.street", field_to_unnest_path_obj="root.user.location"
-                # suffix_parts would be ["street"]
-                suffix_parts = original_path_obj.get_parts()[len(field_to_unnest_path_obj.get_parts()):]
-                
-                # Build the new path: parent_path + suffix_parts
-                transformed_path = parent_path_obj
-                for part in suffix_parts:
-                    transformed_path = transformed_path.append(part)
-                transformed_path_obj = transformed_path
-            
-            path_node_map[transformed_path_obj] = source_node
-
-        new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
-        new_guide.total_docs = self.total_docs 
-        return new_guide
-    
-    def group_and_nest_non_grouping_keys(self, grouping_keys_to_keep, new_path_for_others):
-        """
-        Groups documents by 'grouping_keys_to_keep' (kept at their original level)
-        and moves 'all other attributes' into a new array path.
-        
-        Args:
-            grouping_keys_to_keep (list of str or Path): A list of paths (or string representations of paths)
-                                                        to keep at their original top level.
-            new_path_for_others (str): The name of the new path where all other attributes will be collected into an array. (e.g., 'e').
-
-        Returns:
-            DataGuidePath: A new DataGuidePath object with the transformed schema.
-        """
-        if not grouping_keys_to_keep:
-            raise ValueError("grouping_keys_to_keep cannot be empty.")
-        if not new_path_for_others:
-            raise ValueError("new_path_for_others cannot be empty.")
-
-        processed_grouping_key_paths = []
-        for key in grouping_keys_to_keep:
-            if isinstance(key, str):
-                processed_grouping_key_paths.append(Path(key))
-            elif isinstance(key, Path):
-                processed_grouping_key_paths.append(key)
-            else:
-                raise TypeError("Each grouping key must be a string or a Path object.")
-
-        transformed_path_node_map = {}
-        all_original_leaf_paths = self._gather_paths(self.root)
-        
-        top_level_grouping_segments = {gp.get_parts()[0] for gp in processed_grouping_key_paths if gp.get_parts()}
-
-        for original_path_obj in all_original_leaf_paths:
-            source_node = self._traverse_path(original_path_obj)
-            if source_node is None: continue 
-
-            original_top_level_segment = original_path_obj.get_parts()[0] if original_path_obj.get_parts() else None
-            
-            # Case 1: Path is part of a grouping key's subtree. Keep it at its original level.
-            is_part_of_kept_group = False
-            for gp_obj in processed_grouping_key_paths:
-                if original_path_obj.starts_with(gp_obj):
-                    transformed_path_node_map[original_path_obj] = source_node
-                    is_part_of_kept_group = True
-                    break
-            
-            if not is_part_of_kept_group and original_top_level_segment:
-                # Case 2: This path is NOT part of a grouping key's direct subtree,
-                # AND its top-level segment is NOT one of the grouping keys.
-                # So, it's an "other attribute" that needs to be nested under new_path_for_others.*
-                # Example: 'a' -> 'e.*.a', 'f.*' -> 'e.*.f.*'
-                
-                # Check if this original_path_obj's top-level segment is NOT in the grouping keys.
-                # This ensures we only move "other" top-level attributes.
-                if original_top_level_segment not in top_level_grouping_segments:
-                    transformed_path = Path(new_path_for_others).append('*')
-                    # Append the entire original path after the '*'
-                    for part in original_path_obj.get_parts(): 
-                        transformed_path = transformed_path.append(part)
-                    transformed_path_node_map[transformed_path] = source_node
-
-        new_guide = self._rebuild_guide_from_path_node_map(transformed_path_node_map)
-        new_guide.total_docs = self.total_docs
-        
-        return new_guide # Removed report output
-
     def project(self, paths_to_search_for, new_root_key=None):
         """
         Return a new DataGuide with only paths that contain any of the specified
@@ -1631,483 +1726,288 @@ class DataGuidePath:
         
         return result  
     
-    def _nest_matched_paths_and_filter_others(self, grouping_keys, new_nested_key_name, include_partial_or_null=False):
+    def intersect_new(self, other):
         """
-        (Variant 1 of Group/Nest)
-        Nests paths based on the presence of a set of 'grouping_keys' under a 'new_nested_key_name'.
-        A path is considered for nesting if any part of its full path contains a grouping key.
-        Everything else is either discarded (if include_partial_or_null=False) or moved to a partial/null bucket.
-        
-        Args:
-            grouping_keys (list of str or Path): A list of paths (or string representations of paths)
-                                                  that define the grouping criteria. These paths can
-                                                  exist anywhere within the full path.
-            new_nested_key_name (str): The name of the new key under which the grouped paths will be nested.
-            include_partial_or_null (bool): If True, a "null" or "partial" grouping bucket will be created
-                                            for paths that do not contain any specified grouping keys.
-                                            This bucket will be named '_partial_or_null_group'.
-
-        Returns:
-            tuple: A tuple containing:
-                - DataGuidePath: A new DataGuidePath object with the transformed schema.
-                - dict: A report on grouping key presence, including estimations for impacted documents.
+        Document-based intersection of self and other DataGuidePaths (symmetric).
+        - Keeps only paths present in BOTH guides (structure via _intersect_nodes).
+        - Estimates #docs in intersection using upper bound:
+            max_docs = min(self.total_docs - penalty_self,
+                        other.total_docs - penalty_other)
+        where penalty_* = max docs that are exclusive to that DataGuide (ignoring array children),
+        considering both path and dtype.
+        - Returns a new DataGuidePath.
         """
-        if not grouping_keys:
-            raise ValueError("grouping_keys cannot be empty.")
-        if not new_nested_key_name:
-            raise ValueError("new_nested_key_name cannot be empty.")
+        if not isinstance(other, DataGuidePath):
+            raise TypeError("other must be a DataGuidePath")
 
-        grouping_key_paths = []
-        for key in grouping_keys:
-            if isinstance(key, str):
-                grouping_key_paths.append(Path(key))
-            elif isinstance(key, Path):
-                grouping_key_paths.append(key)
-            else:
-                raise TypeError("Each grouping key must be a string or a Path object.")
+        # Step 1: Intersect structure (path-level)
+        root_node = self._intersect_nodes(self.root, other.root)
+        if root_node is None:
+            root_node = Node()
 
-        transformed_path_node_map = {} 
-        all_original_paths = self._gather_paths(self.root)
-        
-        for original_path_obj in all_original_paths:
-            source_node = self._traverse_path(original_path_obj)
-            if source_node is None: continue 
+        # Step 2: Compute exclusive path+type counts, ignoring array children (.*)
+        def exclusive_counts_no_array_children(dg_self, dg_other):
+            """
+            Compute exclusive document counts for dg_self compared to dg_other,
+            ignoring array element paths (.*), and considering both path+dtype AND frequency.
+            """
+            # Step 1: Build a dictionary of (path, dtype) → count for dg_other
+            other_path_type_counts = {}
+            for path, node in dg_other._iter_paths_and_nodes():
+                if ".*" in path:
+                    continue
+                for dtype, count in node.counters.items():
+                    if count > 0 and dtype not in ("obj", "arr"):
+                        other_path_type_counts[(path, dtype)] = count
 
-            is_matched_for_nesting = False
-            for gp_obj in grouping_key_paths:
-                if self._path_contains_subpath(original_path_obj, gp_obj):
-                    is_matched_for_nesting = True
-                    break
-            
-            if is_matched_for_nesting:
-                transformed_path = Path(new_nested_key_name)
-                for part in original_path_obj.get_parts():
-                    transformed_path = transformed_path.append(part)
-                transformed_path_node_map[transformed_path] = source_node
-            elif include_partial_or_null:
-                transformed_path = Path("_partial_or_null_group")
-                for part in original_path_obj.get_parts():
-                    transformed_path = transformed_path.append(part)
-                transformed_path_node_map[transformed_path] = source_node
-            # else: paths not matched and not for partial/null are implicitly discarded
-        
-        new_guide = self._rebuild_guide_from_path_node_map(transformed_path_node_map)
-        new_guide.total_docs = self.total_docs
+            # Step 2: Compute exclusive counts for dg_self
+            exclusive_counts = []
+            for path, node in dg_self._iter_paths_and_nodes():
+                if ".*" in path:
+                    continue
+                for dtype, count in node.counters.items():
+                    if count == 0 or dtype in ("obj", "arr"):
+                        continue
+                    # If this path+dtype exists in dg_other, subtract min(count_self, count_other)
+                    count_in_other = other_path_type_counts.get((path, dtype), 0)
+                    exclusive = count - count_in_other
+                    if exclusive > 0:
+                        exclusive_counts.append(exclusive)
+                    # If it does not exist in other, full count is exclusive
+                    elif count_in_other == 0:
+                        exclusive_counts.append(count)
+            return exclusive_counts
 
-        # --- Report Generation ---
-        max_impacted_documents_estimate = self.total_docs
-        min_fuzzy_grouping_keys_present_estimate = 0
-        if grouping_key_paths:
-            fuzzy_key_total_docs_estimates = []
-            for gp_obj in grouping_key_paths:
-                fuzzy_key_total_docs_estimates.append(
-                    self._estimate_docs_containing_any_fuzzy_key_occurrence(gp_obj)
-                )
-            if fuzzy_key_total_docs_estimates:
-                min_fuzzy_grouping_keys_present_estimate = min(fuzzy_key_total_docs_estimates)
-        
-        report = {
-            "total_documents_in_guide": self.total_docs,
-            "max_impacted_documents_estimate": max_impacted_documents_estimate,
-            "min_fuzzy_grouping_keys_present_estimate": min_fuzzy_grouping_keys_present_estimate,
-            "grouping_key_presence_counts": {},
-        }
-        
-        for gp_obj in grouping_key_paths:
-            node = self._traverse_path(gp_obj)
-            if node:
-                report["grouping_key_presence_counts"][str(gp_obj)] = sum(node.counters.values())
-            else:
-                report["grouping_key_presence_counts"][str(gp_obj)] = 0
-        
-        return new_guide, report
+        penalty_self = max(exclusive_counts_no_array_children(self, other), default=0)
+        penalty_other = max(exclusive_counts_no_array_children(other, self), default=0)
 
-    def _estimate_documents_with_subpath_intersection_union(self, primary_key_obj, fuzzy_subpath_obj):
+        # Step 3: Estimate max docs in intersection
+        max_docs = min(self.total_docs - penalty_self,
+                    other.total_docs - penalty_other)
+        max_docs = max(0, max_docs)
+
+        # Step 4: Set root.obj and result totals
+        root_node.counters["obj"] = max_docs
+        result = DataGuidePath()
+        result.root = root_node
+        result.total_docs = max_docs
+
+        # Step 5: Cap primitive counters to root.obj (leave obj/arr as-is)
+        def _cap_counters(node, max_docs):
+            for k in list(node.counters.keys()):
+                if k not in ("obj", "arr"):
+                    node.counters[k] = min(node.counters[k], max_docs)
+            for child in node.children.values():
+                _cap_counters(child, max_docs)
+
+        _cap_counters(result.root, max_docs)
+
+        # Step 6: Remove children if no docs survive
+        if max_docs == 0:
+            result.root.children = {}
+
+        return result
+
+    def _intersect_nodes(self, n1, n2):
         """
-        Estimates the number of documents that contain the primary_key_obj
-        AND any path that contains the fuzzy_subpath_obj.
+        Recursive helper: intersect two nodes.
+        - Keeps only paths and counters present in BOTH nodes.
+        - Primitive counters will later be capped by root.obj in intersect_new.
         """
-        if not isinstance(primary_key_obj, Path) or not isinstance(fuzzy_subpath_obj, Path):
-            raise TypeError("Both primary_key_obj and fuzzy_subpath_obj must be Path objects.")
+        if n1 is None or n2 is None:
+            return None
 
-        all_original_leaf_paths = self._gather_paths(self.root)
-        
-        # Find all actual leaf paths in the guide that contain the fuzzy_subpath_obj
-        actual_paths_containing_fuzzy_subpath = []
-        for leaf_path_obj in all_original_leaf_paths:
-            if self._path_contains_subpath(leaf_path_obj, fuzzy_subpath_obj):
-                actual_paths_containing_fuzzy_subpath.append(leaf_path_obj)
-        
-        # Project the primary key once
-        proj_primary_key_guide = self.project([primary_key_obj])
+        new_node = Node()
 
-        estimated_union_total_docs = 0
-    
-        # Sum the estimated intersection counts for each pair.
-        # This implicitly assumes the document sets for each (primary_key, actual_fuzzy_path) pair are mostly disjoint,
-        # or it will overestimate the true union.
-        for actual_fuzzy_path_obj in actual_paths_containing_fuzzy_subpath:
-            # Project the current actual fuzzy path
-            proj_actual_fuzzy_guide = self.project([actual_fuzzy_path_obj])
-            
-            # Get the estimated intersection count using the intuitive helper
-            estimated_intersection_for_pair = self._get_intuitive_intersection_docs_count(
-                proj_primary_key_guide, proj_actual_fuzzy_guide
-            )
-            
-            estimated_union_total_docs += estimated_intersection_for_pair
-            
-        return estimated_union_total_docs
-    
-    def _get_intuitive_intersection_docs_count(self, guide1, guide2):
+        # Intersect counters
+        for dtype in set(n1.counters) & set(n2.counters):
+            v1, v2 = n1.counters[dtype], n2.counters[dtype]
+            if v1 > 0 and v2 > 0:
+                new_node.counters[dtype] = min(v1, v2)
+
+        # Recurse on children present in both nodes
+        for key in set(n1.children) & set(n2.children):
+            child_intersect = self._intersect_nodes(n1.children[key], n2.children[key])
+            if child_intersect is not None and (child_intersect.counters or child_intersect.children):
+                new_node.children[key] = child_intersect
+
+        # Drop node if completely empty
+        if not new_node.counters and not new_node.children:
+            return None
+
+        return new_node
+
+
+    def difference_beta(self, other, mode="lower_bound"):
         """
-        Helper to provide a more intuitive document intersection count for potentially disjoint schema paths.
-        It estimates the intersection as the minimum of the total_docs of the two guides.
-        This is a heuristic when precise overlap cannot be determined from schema alone.
+        Directional estimate: documents in self that are NOT in other.
+        mode: "lower_bound" | "upper_bound" | "mid"
+        - lower_bound: guaranteed minimum unique docs
+        - upper_bound: optimistic maximum unique docs
+        - mid: midpoint (rounded up)
+        Returns a DataGuidePath describing the difference.
         """
-        # This estimate is based on the principle that the number of documents containing both sets of paths
-        # cannot exceed the number of documents in the smaller of the two guides (assuming projection correctly sets total_docs).
-        return min(guide1.total_docs, guide2.total_docs)
+        if not isinstance(other, DataGuidePath):
+            raise TypeError("other must be a DataGuidePath")
+        if mode not in ("lower_bound", "upper_bound", "mid"):
+            raise ValueError("mode must be one of: 'lower_bound','upper_bound','mid'")
 
-    def _estimate_docs_containing_any_fuzzy_key_occurrence(self, fuzzy_key_obj):
-        """
-        Estimates the total number of documents that contain at least one occurrence
-        of the given fuzzy_key_obj (sub-path) anywhere within their full paths.
-        This is a non-recursive version. It finds all relevant top-level keys
-        and sums their document counts from the original guide.
-        """
-        if not isinstance(fuzzy_key_obj, Path):
-            raise TypeError("fuzzy_key_obj must be a Path object.")
-
-        all_original_leaf_paths = self._gather_paths(self.root)
-        
-        unique_top_level_segments_matched = set()
-        for leaf_path_obj in all_original_leaf_paths:
-            if self._path_contains_subpath(leaf_path_obj, fuzzy_key_obj):
-                if leaf_path_obj.get_parts():
-                    unique_top_level_segments_matched.add(Path(leaf_path_obj.get_parts()[0]))
-
-        estimated_document_count = 0
-        for top_level_path_obj in unique_top_level_segments_matched:
-            node_at_top_level = self._traverse_path(top_level_path_obj)
-            if node_at_top_level:
-                estimated_document_count += sum(node_at_top_level.counters.values())
-        
-        return min(self.total_docs, estimated_document_count)
-
-    def _get_intuitive_intersection_docs_count(self, guide1, guide2):
-
-        """
-        Helper to provide a more intuitive document intersection count for potentially disjoint schema paths.
-        It estimates the intersection as the minimum of the total_docs of the two guides.
-        This is a heuristic when precise overlap cannot be determined from schema alone.
-        """
-        # This estimate is based on the principle that the number of documents containing both sets of paths
-        # cannot exceed the number of documents in the smaller of the two guides (assuming projection correctly sets total_docs).
-        return min(guide1.total_docs, guide2.total_docs)
-    
-    def get_min_impact_estimate_for_grouping(self, grouping_keys_to_keep):
-        """
-        Calculates the minimum estimated number of documents that contain
-        at least one of the specified grouping keys.
-        This is used for reporting on the 'group_and_nest_non_grouping_keys' operation.
-        """
-        processed_grouping_key_paths = []
-        for key in grouping_keys_to_keep:
-            if isinstance(key, str):
-                processed_grouping_key_paths.append(Path(key))
-            elif isinstance(key, Path):
-                processed_grouping_key_paths.append(key)
-            else:
-                raise TypeError("Each grouping key must be a string or a Path object.")
-
-        min_kept_grouping_keys_present_estimate = 0
-        if processed_grouping_key_paths:
-            kept_key_total_docs_estimates = []
-            for gp_obj in processed_grouping_key_paths:
-                estimated_val = self._estimate_docs_containing_any_fuzzy_key_occurrence(gp_obj)
-                kept_key_total_docs_estimates.append(estimated_val)
-            
-            kept_key_total_docs_estimates = [x for x in kept_key_total_docs_estimates if x is not None]
-
-            if kept_key_total_docs_estimates:
-                min_kept_grouping_keys_present_estimate = min(kept_key_total_docs_estimates)
-            else:
-                min_kept_grouping_keys_present_estimate = 0
-        
-        return min_kept_grouping_keys_present_estimate
-
-    def get_estimated_docs_for_other_attributes_moved(self, grouping_keys_to_keep, new_path_for_others):
-        """
-        Estimates the number of documents that contain attributes that would be
-        moved into the 'new_path_for_others' array by a grouping operation.
-        """
-        if not new_path_for_others:
-            raise ValueError("new_path_for_others must be provided.")
-
-        processed_grouping_key_paths = []
-        for key in grouping_keys_to_keep:
-            if isinstance(key, str):
-                processed_grouping_key_paths.append(Path(key))
-            elif isinstance(key, Path):
-                processed_grouping_key_paths.append(key)
-            else:
-                raise TypeError("Each grouping key must be a string or a Path object.")
-
-        all_original_leaf_paths = self._gather_paths(self.root)
-        top_level_grouping_segments = {gp.get_parts()[0] for gp in processed_grouping_key_paths if gp.get_parts()}
-
-        estimated_docs_with_other_attributes_moved = 0
-        other_attributes_paths_for_report = set()
-        for original_path_obj in all_original_leaf_paths:
-            original_top_level_segment = original_path_obj.get_parts()[0] if original_path_obj.get_parts() else None
-            is_part_of_kept_group = False
-            for gp_obj in processed_grouping_key_paths:
-                if original_path_obj.starts_with(gp_obj):
-                    is_part_of_kept_group = True
-                    break
-            if not is_part_of_kept_group and original_top_level_segment and original_top_level_segment not in top_level_grouping_segments:
-                other_attributes_paths_for_report.add(Path(original_top_level_segment)) 
-        
-        if other_attributes_paths_for_report:
-            for path_obj in other_attributes_paths_for_report:
-                estimated_docs_with_other_attributes_moved += self._estimate_docs_containing_any_fuzzy_key_occurrence(path_obj)
-            estimated_docs_with_other_attributes_moved = min(self.total_docs, estimated_docs_with_other_attributes_moved)
-
-        return estimated_docs_with_other_attributes_moved
-
-    def _apply_aggregations(self, aggregation_specs):
-        """
-        Handles list of (fname, path, newpath) aggregation specs.
-        Returns a new DataGuidePath with each aggregation result placed at `newpath`.
-        """
-        allowed_funcs = {"sum", "count", "avg", "min", "max"}
-        path_node_map = {}
-
-        for spec in aggregation_specs:
-            if len(spec) != 3:
-                raise ValueError("Each aggregation spec must be (fname, source_path, newpath)")
-
-            fname, source_path_raw, target_path_raw = spec
-
-            if fname not in allowed_funcs:
-                raise ValueError(f"Unsupported aggregation function: {fname}")
-
-            source_path = Path(source_path_raw)
-            target_path = Path(target_path_raw)
-
-            node = self._traverse_path(source_path)
-            if not node:
-                print(f"Skipping aggregation: {source_path} not found in guide.")
+       
+        # Step 1: Build other (path,dtype) -> count map
+        other_pt_counts = {}
+        for path, node in other._iter_paths_and_nodes():
+            if ".*" in path:
                 continue
+            for dtype, cnt in node.counters.items():
+                if cnt > 0:
+                    other_pt_counts[(path, dtype)] = cnt
 
-            # Create the output node
-            agg_node = Node()
-
-            # Determine output type
-            if fname == "count":
-                agg_node.counters["int"] = 1  # count is always int
-            elif fname in {"sum", "avg"}:
-                if node.counters.get("float", 0) or node.counters.get("int", 0):
-                    agg_node.counters["float"] = 1
-                else:
-                    print(f"Skipping aggregation: {fname} cannot apply to non-numeric {source_path}")
+        # Step 2: For self collect exclusive counts per (path,dtype) 
+        exclusive_map = {}         # path -> { dtype: exclusive_count, ... }
+        path_to_node = {}          # path -> node_in_self  (for cloning)
+        for path, node in self._iter_paths_and_nodes():
+            if ".*" in path:
+                continue
+            path_to_node[path] = node
+            for dtype, cnt in node.counters.items():
+                if cnt == 0:
                     continue
-            elif fname in {"min", "max"}:
-                found_type = None
-                for t in ["int", "float", "str", "date"]:
-                    if node.counters.get(t, 0):
-                        found_type = t
-                        break
-                if not found_type:
-                    print(f"Skipping aggregation: {fname} has no valid types for {source_path}")
-                    continue
-                agg_node.counters[found_type] = 1
+                other_cnt = other_pt_counts.get((path, dtype), 0)
+                exclusive = cnt - other_cnt
+                if exclusive > 0:
+                    exclusive_map.setdefault(path, {})[dtype] = exclusive
 
-            path_node_map[target_path] = agg_node
+        # Step 3: Compute bounds and choose estimate
+        # lower_bound includes guaranteed total-difference
+        all_exclusive_counts = [v for dm in exclusive_map.values() for v in dm.values()]
+        guaranteed_by_paths = max(all_exclusive_counts) if all_exclusive_counts else 0
+        guaranteed_by_totals = max(0, self.total_docs - other.total_docs)
+        lb = max(guaranteed_by_paths, guaranteed_by_totals)
 
-        if not path_node_map:
-            print("No valid aggregation outputs were generated.")
-            return DataGuidePath()
+        if all_exclusive_counts:
+            ub = min(sum(all_exclusive_counts), self.total_docs)
+        else:
+            ub = self.total_docs
 
-        # Build new guide
-        new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
-        new_guide.total_docs = self.total_docs
-        return new_guide
+        if mode == "lower_bound":
+            est = lb
+        elif mode == "upper_bound":
+            est = ub
+        else:  # mid
+            est = (lb + ub + 1) // 2
+
+        est = max(0, est)
+
+        # Step 4: Build result DataGuidePath
+        result = DataGuidePath()
+        result.root = Node()
+        result.total_docs = est
+        result.root.counters["obj"] = est
+
+        def _attach_subtree_at_path(root_node, path, subtree_node):
+            parts = path.split(".")
+            cur = root_node
+            for p in parts[:-1]:
+                if p not in cur.children:
+                    cur.children[p] = Node()
+                cur = cur.children[p]
+            last = parts[-1]
+            cur.children[last] = self._clone_subtree(subtree_node)
+
+        def _attach_shallow_node_at_path(root_node, path, dtype_counts):
+            parts = path.split(".")
+            cur = root_node
+            for p in parts[:-1]:
+                if p not in cur.children:
+                    cur.children[p] = Node()
+                cur = cur.children[p]
+            last = parts[-1]
+            node = cur.children.get(last, Node())
+            for dt, v in dtype_counts.items():
+                node.counters[dt] = node.counters.get(dt, 0) + v
+            cur.children[last] = node
+
+        other_paths = other._path_set()
+
+        for path, dtype_map in exclusive_map.items():
+            if path not in other_paths:
+                node_self = path_to_node.get(path)
+                if node_self is not None:
+                    cloned = self._clone_subtree(node_self)
+                    # reduce primitive counters to exclusive values (if present)
+                    for k in list(cloned.counters.keys()):
+                        if k in ("obj", "arr"):
+                            continue
+                        if k in dtype_map:
+                            cloned.counters[k] = dtype_map[k]
+                    _attach_subtree_at_path(result.root, path, cloned)
+            else:
+                # path exists in other as well, attach the shallow exclusive info
+                _attach_shallow_node_at_path(result.root, path, dtype_map)
+
+        # Step 5: Cap primitive counters to est
+        def _cap_counters(node, cap):
+            for k in list(node.counters.keys()):
+                if k not in ("obj", "arr"):
+                    node.counters[k] = min(node.counters.get(k, 0), cap)
+            for child in node.children.values():
+                _cap_counters(child, cap)
+
+        _cap_counters(result.root, est)
 
 
-    def unnest_schema(self, unnest_specs=None):
-        if not unnest_specs:
-            return self
+        # Step 6: If est==0 remove children
+        if est == 0:
+            result.root.children = {}
 
-        final_path_node_map = {}
-        all_original_paths_flat = set()
-        all_paths_to_exclude = set()
-        force_arr_paths = set()
+        return result
 
-        def _collect_all_paths(node, current_path_obj):
-            if str(current_path_obj) != "":
-                all_original_paths_flat.add(current_path_obj)
+    def _iter_paths_and_nodes(self):
+        """Yield (path_str, node) for every path (excluding the artificial 'root' label)."""
+        stack = [("", self.root)]
+        while stack:
+            prefix, node = stack.pop()
             for key, child in node.children.items():
-                _collect_all_paths(child, current_path_obj.append(key))
+                path = f"{prefix}.{key}" if prefix else key
+                yield path, child
+                stack.append((path, child))
 
-        _collect_all_paths(self.root, Path(""))
+    def _path_set(self):
+        """All schema paths (strings) present in this DataGuide, excluding the empty root."""
+        return {p for p, _ in self._iter_paths_and_nodes()}
 
-        for source_array_path_raw, fields_to_unnest_list_raw in unnest_specs:
-            source_array_path_obj = Path(source_array_path_raw)
-            if not source_array_path_obj.endswith("*"):
-                raise ValueError(f"Unnest path must end in '*': {source_array_path_obj}")
-
-            fields_to_unnest_objs = [Path(p) for p in fields_to_unnest_list_raw]
-            unnested_map = self._transform_paths_for_unnest_spec(source_array_path_obj, fields_to_unnest_objs)
-            final_path_node_map.update(unnested_map)
-
-            parent_path = source_array_path_obj.get_parent_path()
-            force_arr_paths.add(parent_path)
-            all_paths_to_exclude.add(parent_path)
-
-            wildcard_prefix = source_array_path_obj.get_parts()
-            for p in all_original_paths_flat:
-                if p.get_parts()[:len(wildcard_prefix)] == wildcard_prefix:
-                    all_paths_to_exclude.add(p)
-
-        for p in all_original_paths_flat:
-            if str(p) == "":
-                continue  # ✅ skip root
-            if p not in all_paths_to_exclude and p not in final_path_node_map:
-                node = self._traverse_path(p)
-                if node:
-                    final_path_node_map[p] = node
-
-        result_guide = self._rebuild_guide_for_unnest(
-            final_path_node_map,
-            force_arr_paths=force_arr_paths
+    def _doc_count_for_node(self, node):
+        """
+        Estimated document-count presence for a path node.
+        Use the larger of:
+        - object/array presence ('obj'/'arr'), or
+        - sum of primitive type counters (int/str/float/date/etc.)
+        This is a conservative 'docs containing this path' proxy.
+        """
+        obj_arr = max(node.counters.get("obj", 0), node.counters.get("arr", 0))
+        primitives = sum(
+            v for k, v in node.counters.items()
+            if k not in ("obj", "arr")  # treat remaining counters as primitives
         )
+        return max(obj_arr, primitives)
 
-        # --- Conservative document expansion ---
-        # --- Conservative document expansion ---
-        expanded_count = 0
-        for source_array_path_raw, _ in unnest_specs:
-            parent_path = Path(source_array_path_raw).get_parent_path()
-            lengths = self._array_lengths.get(str(parent_path), [])
-            if lengths:
-                expanded_count += sum(max(1, l) for l in lengths)
-            else:
-                expanded_count += self.total_docs  # fallback
-
-
-        result_guide.total_docs = expanded_count
-
-        # --- Scale original fields only ---
-        flattened_paths_from_array = set(final_path_node_map) - set(all_original_paths_flat)
-
-        if self.total_docs > 0 and expanded_count > 0:
-            scale_factor = expanded_count / self.total_docs
-            for path in final_path_node_map:
-                if path in flattened_paths_from_array:
-                    continue  # skip new unnested paths
-                node = result_guide._traverse_path(path)
-                if node:
-                    for dtype in node.counters:
-                        node.counters[dtype] = int(round(node.counters[dtype] * scale_factor))
-
-        return result_guide
- 
-  
-    def _transform_paths_for_unnest_spec(self, source_array_path_obj, fields_to_unnest_list_objs):
+    def _exclusive_path_counts_no_array_children(self, other):
         """
-        Transforms nested paths under a wildcard path (e.g., 'items.*') into flattened paths
-        (e.g., 'items.qty') for the fields specified.
-
-        Args:
-            source_array_path_obj (Path): Path object ending in '*' indicating the array root.
-            fields_to_unnest_list_objs (list of Path): Relative paths within the array elements to unnest.
-
-        Returns:
-            dict[Path, Node]: Mapping of new flattened paths to their corresponding nodes in the schema.
+        Counts paths in self that don't exist in other, 
+        but ignores paths that are children of arrays (.*).
+        Returns list of counts per path.
         """
-
-        path_node_map = {}
-        wildcard_parts = source_array_path_obj.get_parts()
-        if not wildcard_parts or wildcard_parts[-1] != "*":
-            raise ValueError(f"Expected array path to end with '*', got: {source_array_path_obj}")
-
-        all_leaf_paths = self._gather_paths_for_unnest(self.root)
-        wildcard_len = len(wildcard_parts)
-
-        for leaf_path in all_leaf_paths:
-            leaf_parts = leaf_path.get_parts()
-            if leaf_parts[:wildcard_len] != wildcard_parts:
+        other_paths = other._path_set()
+        counts = []
+        for p, n in self._iter_paths_and_nodes():
+            # Ignore array children paths
+            if ".*" in p:
                 continue
-
-            relative_parts = leaf_parts[wildcard_len:]
-            relative_path = Path(".".join(relative_parts)) if relative_parts else Path("")
-
-            if not fields_to_unnest_list_objs or any(relative_path.starts_with(f) for f in fields_to_unnest_list_objs):
-                base_parts = wildcard_parts[:-1]
-                new_path = Path(".".join(relative_parts))
-
-                node = self._traverse_path(leaf_path)
-                if node:
-                    path_node_map[new_path] = node
-
-        return path_node_map
-
-    def _rebuild_guide_for_unnest(self, path_node_map, force_arr_paths=None):
-        new_guide = DataGuidePath()
-        force_arr_paths = set(force_arr_paths or [])
-
-        for path_obj in sorted(path_node_map.keys(), key=str):
-            if str(path_obj) == "":
-                continue  # ✅ skip root — handled manually in unnest_schema
-
-            source_node = path_node_map[path_obj]
-            current_node = new_guide.root
-            parts = path_obj.get_parts()
-
-            for i, part in enumerate(parts):
-                if part not in current_node.children:
-                    current_node.children[part] = Node()
-
-                is_leaf = (i == len(parts) - 1)
-                path_so_far = Path(".".join(parts[:i + 1]))
-
-                if not is_leaf:
-                    next_part = parts[i + 1]
-                    if next_part == "*" or path_so_far in force_arr_paths:
-                        current_node.counters["arr"] = 1
-
-                current_node = current_node.children[part]
-
-            current_node.counters = source_node.counters.copy()
-
-        new_guide._ensure_root_obj()
-        return new_guide
+            if p not in other_paths:
+                counts.append(self._doc_count_for_node(n))
+        return counts
 
 
-    def _gather_paths_for_unnest(self, node, current_path=None):
-        """
-        Recursively collects all leaf paths in the schema, starting from 'root',
-        to support unnesting logic.
 
-        Args:
-            node (Node): The current schema node being traversed.
-            current_path (Path): The path built up so far during recursion.
-
-        Returns:
-            list[Path]: All leaf paths found in the schema.
-        """
-
-        if current_path is None:
-            current_path = Path("root")
-
-        paths = []
-        if not node.children:
-            paths.append(current_path)
-        for key, child in node.children.items():
-            paths.extend(self._gather_paths_for_unnest(child, current_path.append(key)))
-        return paths
-
-        
 
         
