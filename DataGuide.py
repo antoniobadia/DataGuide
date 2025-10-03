@@ -842,6 +842,7 @@ class DataGuidePath:
         Includes parent nodes as needed. Updates total_docs to reflect the
         minimum number of documents that could contain all projected paths.
         """
+<<<<<<< HEAD
         #Create a new DataGuide object for the projection result
         new_guide = DataGuidePath()
         
@@ -869,6 +870,33 @@ class DataGuidePath:
             #Sum all counter values for the 'source_leaf' node and append to min_counts
             min_counts.append(sum(source_leaf.counters.values()))
 
+=======
+        #Create a new DataGuide object. This will be the result of the projection. The return
+        new_guide = DataGuide()
+        
+        #Initialize an empty list to store the sum of counts for each specified path
+        #This will be used later to determine the total_docs for the new guide
+        min_counts = []
+
+        #Iterate through each path provided in the 'paths' list
+        for path in paths:
+            #Attempt to traverse the current path in the original DataGuide(self)
+            #This returns the leaf Node object if the path exists, otherwise None
+            source_leaf = self._traverse_path(path)
+            
+            #If the path does not exist skip it and move to the next path
+            if source_leaf is None:
+                continue  
+            
+            #Sum all counter values (int, str, etc.) for the 'source_leaf' node
+            #This sum represents the total number of times this specific path was encountered across all documents,
+            #This value is appended to the 'min_counts' list
+            min_counts.append(sum(source_leaf.counters.values()))
+
+            #Split the current path string into its individual segments (example, "root.b.c" becomes ["root", "b", "c"]).
+            parts = path.split(".")
+            
+>>>>>>> 322e647b0beff30376eb5ea5e14f29808acb0645
             #Initialize 'source_node' to the root of the original DataGuide.
             source_node = self.root
             
@@ -876,13 +904,23 @@ class DataGuidePath:
             target_node = new_guide.root
 
             #Iterate through each segment (part) of the current path.
+<<<<<<< HEAD
             for part in path_obj.get_parts(): 
                 #Check if the current 'part' exists as a child in the 'source_node'
+=======
+            for part in parts:
+                #Check if the current 'part' exists as a child in the 'source_node' of the original DataGuide.
+>>>>>>> 322e647b0beff30376eb5ea5e14f29808acb0645
                 if part not in source_node.children:
                     #If it doesn't exist, it means the path was incomplete or incorrect
                     break
 
+<<<<<<< HEAD
                 #If the current 'part' does not exist as a child in the 'target_node', create a new Node for it.
+=======
+                #If the current 'part' does not exist as a child in the 'target_node' of the new DataGuide,
+                #Create a new Node for it. This ensures parent nodes are included in the projection
+>>>>>>> 322e647b0beff30376eb5ea5e14f29808acb0645
                 if part not in target_node.children:
                     target_node.children[part] = Node()
 
@@ -892,17 +930,32 @@ class DataGuidePath:
                 #Move 'target_node' down to its newly created or existing child corresponding to 'part'
                 target_node = target_node.children[part]
 
+<<<<<<< HEAD
                 #Copy the counters from the 'source_node' to the 'target_node'
+=======
+                #Copy the counters from the 'source_node' (from the original DataGuide),
+                #To the 'target_node' (in the new projected DataGuide)
+                #This ensures that intermediate nodes in the projected path also have their correct counts
+>>>>>>> 322e647b0beff30376eb5ea5e14f29808acb0645
                 target_node.counters = source_node.counters.copy()
 
         #Calculate the sum of all counts collected for the specified paths
         sum_counts = sum(min_counts)
         
         #Set the 'total_docs' for the new projected DataGuide
+<<<<<<< HEAD
+=======
+        #It's set to the minimum of the original DataGuide's total_docs and the calculated sum_counts
+        #This estimates the minimum number of documents that would contain all the projected paths
+>>>>>>> 322e647b0beff30376eb5ea5e14f29808acb0645
         new_guide.total_docs = min(self.total_docs, sum_counts)
         
         #Return the newly created DataGuide
         return new_guide
+<<<<<<< HEAD
+=======
+        
+>>>>>>> 322e647b0beff30376eb5ea5e14f29808acb0645
     def intersect(self, other):
         """
         Method to intersect two dataguides, as if an intersection was performed on original JSON documents
@@ -1148,6 +1201,11 @@ class DataGuidePath:
         It estimates the intersection as the minimum of the total_docs of the two guides.
         This is a heuristic when precise overlap cannot be determined from schema alone.
         """
+<<<<<<< HEAD
         # This estimate is based on the principle that the number of documents containing both sets of paths
         # cannot exceed the number of documents in the smaller of the two guides (assuming projection correctly sets total_docs).
         return min(guide1.total_docs, guide2.total_docs)
+=======
+        if self.root.counters['obj'] == 0 and self.root.children != {}:
+            self.root.counters['obj'] = 1
+>>>>>>> 322e647b0beff30376eb5ea5e14f29808acb0645
