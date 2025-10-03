@@ -27,7 +27,7 @@ class Node:
         else:
             #set counter equal to delta
             self.counters[type_name] = delta
-        
+    
     def to_dict(self):
         """
         Method to convert node to dictionary for output
@@ -38,7 +38,7 @@ class Node:
             "counters": self.counters,
             "children": children_dict
         }
-    
+
     @classmethod
     def from_dict(cls, d):
         """
@@ -51,8 +51,106 @@ class Node:
         #Add children to node
         node.children = {key: cls.from_dict(child_dict) for key, child_dict in d.get("children", {}).items()}
         return node
+    
+class Path:
+    def __init__(self, path_string):
+        """
+        Initialization method for Path
+        """
+        #Check if path input is string
+        if not isinstance(path_string, str):
+            raise TypeError("Path must be a string.")
+        
+        #Check if path input is root or empty string
+        if path_string == "root" or path_string == "":
+            #Set parts to empty list
+            self._parts = []
+        else:
+            #Split path into individual parts
+            self._parts = path_string.split('.')
 
-class DataGuide:
+    def __str__(self):
+        """
+        Returns the string representation of the path
+        """
+        #Return 'root' if no parts, otherwise join parts with '.'
+        return "root" if not self._parts else ".".join(self._parts)
+
+    def __repr__(self):
+        """
+        Returns a user friendly representation of the Path object
+        """
+        return f"Path('{str(self)}')"
+
+    def __eq__(self, other):
+        """
+        Compares two Path objects for equality
+        """
+        #If other is not a Path object, return NotImplemented
+        if not isinstance(other, Path):
+            return NotImplemented
+        #Return boolean based on if parts are equal
+        return self._parts == other._parts
+
+    def __hash__(self):
+        """
+        Enables Path objects to be used in sets and as dictionary keys
+        """
+        #Return hash of tuple of path parts
+        return hash(tuple(self._parts))
+
+    def get_parts(self):
+        """
+        Returns a list of the individual parts of the path
+        """
+        #Return copy of parts list
+        return list(self._parts)
+
+    def append(self, key):
+        """
+        Returns a new Path object with a new key appended
+        """
+        #If key is not a string or is empty, raise ValueError
+        if not isinstance(key, str) or not key:
+            raise ValueError("Key to append must be a non-empty string.")
+        #Create a new list of parts
+        new_parts = list(self._parts)
+        #Append new key to parts list
+        new_parts.append(key)
+        #Return new Path object
+        return Path(".".join(new_parts))
+    
+    def get_parent_path(self):
+        """
+        Returns a new Path object representing the parent path.
+        Returns Path('root') if this path has only one part (e.g., 'a').
+        Returns Path('root') if this path is already 'root'.
+        """
+        # If the path has no parts (it's the 'root' path), its parent is also 'root'
+        if not self._parts: 
+            return Path("root")
+        # If the path has only one part (e.g., 'a'), its parent is 'root'
+        if len(self._parts) == 1:
+            return Path("root") 
+        # Otherwise, join all parts except the last one to form the parent path
+        return Path(".".join(self._parts[:-1]))
+
+    def starts_with(self, prefix_path):
+        """
+        Checks if this path starts with the given prefix path.
+        """
+        # If prefix_path is not a Path object, return False
+        if not isinstance(prefix_path, Path):
+            return False
+        
+        # If this path is shorter than the prefix path, it cannot start with it
+        if len(self._parts) < len(prefix_path._parts):
+            return False
+            
+        # Check if the initial segment of this path matches the prefix path's parts
+        return self._parts[:len(prefix_path._parts)] == prefix_path._parts
+
+class DataGuidePath:
     def __init__(self):
         """
         Initialization method for DataGuide
@@ -62,45 +160,49 @@ class DataGuide:
         #Initialize document counter
         self.total_docs = 0
 
-    def search(self, path):
+    def core(self):
         """
-        Search method, returns boolean based on if path is present in data guide
+        Method to return core items from data guide
+        -- A core item is one present in every document
         """
-        #Call helper method to move through path
-        node = self._traverse_path(path)
-        #Return boolean based on if path is present
-        return node is not None
-
-    def _traverse_path(self, path):
+        #Create new data guide object for the core items
+        core_guide = DataGuidePath()
+        #Set the total documents of the core guide to that of the current guide
+        core_guide.total_docs = self.total_docs
+        #Call helper method to extract core items, starting from the root
+        core_guide.root = self._extract_core(self.root)
+        return core_guide
+    
+    def _extract_core(self, node):
         """
-        Helper method to move through a path, starting at the root node and moving from child to child until path is complete or and end is reached
+        Helper method to check if an item appears in every document
         """
-        #Check if path input is root, if so return root
-        if not path or path == "root":
-            return self.root
-        #Split path into individual nodes
-        parts = path.split('.')
-        #Start at root node
-        current = self.root
-        #Iterate through nodes
-        for part in parts:
-            #Check if next node is a child of current node
-            if part in current.children:
-                current = current.children[part]
-            else:
-                #Return None if node not a child of current node
-                return None
-        #Return leaf node of path
-        return current
+        #Sum total count of types stored at the current node
+        sum_counts = sum(node.counters.values())
+        #Return None if the node's items are not present in every document
+        if sum_counts != self.total_docs:
+            return None
+        #Create a new node to store the core items
+        new_node = Node()
+        #Copy core node's counters into the new core guide's node
+        new_node.counters = node.counters.copy()
+        #Iterate over children of the current node
+        for key, child in node.children.items():
+            #Recursive call on child nodes to find core children
+            core_child = self._extract_core(child)
+            #If a core child is found, add it to the new node's children
+            if core_child is not None:
+                new_node.children[key] = core_child
+        return new_node
     
     def _get_type(self, value):
         """
         Helper method to return the type of data stored at a key
         """
-        #Check if value is dictionary (nested JSON object)
+        #Check if value is dictionary
         if isinstance(value, dict):
             return "obj"
-        #Check if value is list (array)
+        #Check if value is list
         elif isinstance(value, list):
             return "arr"
         #Check if value is integer
@@ -143,7 +245,8 @@ class DataGuide:
             self.total_docs += 1
             self._insert_value(self.root, doc)
 
-    def _insert_value(self, node, value): # Here value can be an entire document, a nested sub-object , a list, or a primitive value input through recursion
+    # Here value can be an entire document, a nested sub-object , a list, or a primitive value input through recursion
+    def _insert_value(self, node, value): 
         """
         Helper method to insert a single value, called recursively on objects and arrays
         """
@@ -175,8 +278,7 @@ class DataGuide:
             type_name = self._get_type(value)
             #Increase counter for value
             node.update_counter(type_name)
-    
-    #Not properly deleting documents#########################
+
     def delete_document(self, doc):
         """
         Method to delete document from data guide
@@ -230,7 +332,7 @@ class DataGuide:
             type_name = self._get_type(value)
             #Update counter of type stored
             node.update_counter(type_name, delta=-1)
-        
+    
     def print_guide(self):
         """
         Method to print the data stored in a dataguide
@@ -276,18 +378,16 @@ class DataGuide:
     @classmethod
     def from_dict(cls, d):
         """
-        Class method to convert data guide text file to dictionary for output
+        Class method to convert data guide dictionary to DataGuidePath object
         """
         #Create new data guide
         guide = cls()
-        #Get total documents number from data guide text file
+        #Get total documents number from data guide dictionary
         guide.total_docs = d.get("total_docs", 0)
-        #Set root node and recursively call function to iterate through data guide dictionary in text file
+        #Set root node and recursively call function to iterate through data guide dictionary
         guide.root = Node.from_dict(d.get("root", {}))
         return guide
 
-    
-    
     @classmethod
     def load(cls, filename):
         """
@@ -300,151 +400,40 @@ class DataGuide:
         #Convert from dictionary to data guide object
         return cls.from_dict(d)
     
-    def core(self):
-        """
-        Method to return core items from data guide
-        -- A core item is one present in every document
-        """
-        #Create new data guide object for core
-        core_guide = DataGuide()
-        #Get total number of documents from data guide
-        core_guide.total_docs = self.total_docs
-        #Call extract core function to get core items
-        core_guide.root = self._extract_core(self.root)
-        return core_guide
-    
-    def _extract_core(self, node):
-        """
-        Helper method to check if an item appears in every document
-        """
-        #Sum total count of types stored at node
-        sum_counts = sum(node.counters.values())
-        #Return none if not a core node
-        if sum_counts != self.total_docs:
-            return None
-        #Create a new node to store core nodes
-        new_node = Node()
-        #Copy core node into core data guide
-        new_node.counters = node.counters.copy()
-        #Iterate over children of node
-        for key, child in node.children.items():
-            #Recursive call on child nodes
-            core_child = self._extract_core(child)
-            #Add core children to core node if a core child
-            if core_child is not None:
-                new_node.children[key] = core_child
-        return new_node
-    
-    def card(self, path=None):
-        """
-        Method to extract cardinality from data guide
-        """
-        #If no path is input, compute cardinality of root
-        if path is None:
-            node = self.root
-        #Path is input
-        else:
-            #Traverse input path
-            node = self._traverse_path(path)
-            #If node holds no values return empty counters dictionary
-            if node is None:
-                return counters()
-        #Call sum counters method
-        return self._sum_counters(node)
-    
-    def _sum_counters(self, node):
-        """
-        Method to return the sum of counters for path or data guide
-        """
-        #Create empty total dictionary
-        total = {}
-        #Iterate over key value pairs at node
-        for key, value in node.counters.items():
-            #Store key and sum counters
-            total[key] = total.get(key, 0) + value
-        #Iterate over children of node
-        for child in node.children.values():
-            #Recusive call to function to sum child node counters
-            child_sum = self._sum_counters(child)
-            #Iterate over key value pairs in child sum dictionary
-            for key, value in child_sum.items():
-                #Store key and sum counters
-                total[key] = total.get(key, 0) + value
-        return total
-    
-    def union(self, other):
-        """
-        Method used to union two dataguides, other is a second dataguide
-        """
-        #Create new guide to store union
-        new_guide = DataGuide()
-        #Add total docs of each guide together and assign
-        new_guide.total_Docs = self.total_docs + other.total_docs
-        #Call helper method to union the nodes
-        new_guide.root = self._union_nodes(self.root, other.root)
-        return new_guide
-    
-    def _union_nodes(self, node1, node2):
-        """
-        Helper method used to combine two nodes, one from each guide, into new node
-        """
-        #Create new node to store key and value counts
-        new_node = Node()
-        #Get all stored types of each node input into method
-        all_types = set(node1.counters.keys()) | set(node2.counters.keys())
-        #Iterate over types
-        for t in all_types:
-            #Combine counters of nodes
-            new_node.counters[t] = node1.counters.get(t, 0) + node2.counters.get(t, 0)
-        #Get all child keys of root nodes
-        all_keys = set(node1.children.keys()) | set(node2.children.keys())
-        #Iterate over child keys
-        for key in all_keys:
-            #Get first two child keys
-            child1 = node1.children.get(key)
-            child2 = node2.children.get(key)
-            #If both keys are the same
-            if child1 and child2:
-                #Recursive call on child nodes
-                new_node.children[key] = self._union_nodes(child1, child2)
-            #If child1 key is present
-            elif child1:
-                #Add child key to current node's children
-                new_node.children[key] = child1
-            #If child2 key is present
-            elif child2:
-                #Add child key to current node's children
-                new_node.children[key] = child2
-        return new_node
-    
     def difference(self, other):
         """
         Method to compute the difference between data guides
         """
-        #Create result data guide to store difference
-        result = DataGuide()
-        #Get total document count and assign to new dataguide
+        # Create result data guide to store difference
+        result = DataGuidePath()
+        # Get total document count and assign to new dataguide
         result.total_docs = self.total_docs
-        #Call helper function on root nodes
+        
+        # Call helper function on root nodes
         root_diff = self._subtract_nodes(self.root, other.root)
-        #Assign root node if one exists, else empty node
+        # Assign root node if one exists, else empty node
         result.root = root_diff if root_diff is not None else Node()
-        #Used to store number of unique keys
+        
+        # Used to store number of unique keys
         uniques_total = 0
-        #Gather paths in each data guide
-        self_paths = set(self._gather_paths(self.root))
-        other_paths = set(self._gather_paths(other.root))
-        #Iterate over unique paths
-        for path in self_paths - other_paths:
-            #Get nodes of path
-            node = self._traverse_path(path)
-            #If a node exists
+        
+        # Gather paths in each data guide (these now return sets of Path objects)
+        self_paths = set(self._gather_paths(self.root)) 
+        other_paths = set(other._gather_paths(other.root))
+        
+        # Iterate over unique paths (Path objects can be in sets due to __hash__ and __eq__)
+        for path_obj in self_paths - other_paths:
+            # Get nodes of path (path_obj is passed directly to _traverse_path)
+            node = self._traverse_path(path_obj)
+            # If a node exists
             if node:
-                #Sum unique counters
+                # Sum unique counters
                 uniques_total += sum(node.counters.values())
-        #Object counter in root set to minimum between total documents and unique counters
+        
+        # Object counter in root set to minimum between total documents and unique counters
         result.root.counters['obj'] = min(self.total_docs, uniques_total)
-        #Ensures root atleast has one object
+        
+        # Ensures root atleast has one object
         result._ensure_root_obj()
         return result
 
@@ -482,7 +471,6 @@ class DataGuide:
             return None
         return new_node
     
-
     def _clone_subtree(self, node):
         """
         Helper method to copy an entire subtree of nodes when only one child
@@ -497,48 +485,424 @@ class DataGuide:
             copy.children[key] = self._clone_subtree(child)
         return copy
     
+    def _sum_counters(self, node):
+        """
+        Method to return the sum of counters for path or data guide
+        """
+        #Create empty dictionary to store total counts
+        total = {}
+        #Iterate over key-value pairs (type and count) at the current node
+        for key, value in node.counters.items():
+            #Store key and sum counters
+            total[key] = total.get(key, 0) + value
+        #Iterate over children of the current node
+        for child in node.children.values():
+            #Recursive call to function to sum child node counters
+            child_sum = self._sum_counters(child)
+            #Iterate over key-value pairs in the child's sum dictionary
+            for key, value in child_sum.items():
+                #Store key and sum counters (aggregating counts from children)
+                total[key] = total.get(key, 0) + value
+        return total
+    
+    def union(self, other):
+        """
+        Method used to union two dataguides, other is a second dataguide
+        """
+        #Create new guide to store the union result
+        new_guide = DataGuidePath()
+        #Add total documents of both guides together and assign to the new guide
+        new_guide.total_Docs = self.total_docs + other.total_docs
+        #Call helper method to union the root nodes of both guides
+        new_guide.root = self._union_nodes(self.root, other.root)
+        return new_guide
+    
+    def _union_nodes(self, node1, node2):
+        """
+        Helper method used to combine two nodes, one from each guide, into new node
+        """
+        #Create new node to store combined key and value counts
+        new_node = Node()
+        # Get all unique types present in either node1 or node2's counters
+        all_types = set(node1.counters.keys()) | set(node2.counters.keys())
+        # Iterate over all collected types
+        for t in all_types:
+            # Combine counters of nodes for the current type
+            new_node.counters[t] = node1.counters.get(t, 0) + node2.counters.get(t, 0)
+
+        # Get all unique child keys present in either node1 or node2's children
+        all_keys = set(node1.children.keys()) | set(node2.children.keys())
+        # Iterate over all collected child keys
+        for key in all_keys:
+            # Get the child node for the current key from both input nodes
+            child1 = node1.children.get(key)
+            child2 = node2.children.get(key)
+
+            # If both children exist for the current key
+            if child1 and child2:
+                # Recursively call _union_nodes to combine these children
+                new_node.children[key] = self._union_nodes(child1, child2)
+            # If only child1 exists for the current key
+            elif child1:
+                # Clone its entire subtree and add to the new node's children
+                new_node.children[key] = self._clone_subtree(child1)
+            # If only child2 exists for the current key
+            elif child2:
+                # Clone its entire subtree and add to the new node's children
+                new_node.children[key] = self._clone_subtree(child2)
+        return new_node
+
+    """ ==== These methods use Path Class ==== """
+
+    def _rebuild_guide_from_path_node_map(self, path_node_map):
+        """
+        Helper to reconstruct a new DataGuidePath's tree from a map of
+        transformed Path objects to their source Node objects.
+        This will copy leaf counters. Parent 'obj' and 'arr' counters
+        will be set to reflect structural presence (i.e., at least 1 if they have children)
+        rather than summed document counts.
+        """
+        new_guide = DataGuidePath()
+
+        # Sort paths to ensure consistent tree building order
+        for path_obj in sorted(path_node_map.keys(), key=str):
+            # Get the original node for this leaf
+            source_node_for_leaf = path_node_map[path_obj] 
+            
+            current_target_node = new_guide.root
+            parts = path_obj.get_parts()
+
+            for i, part in enumerate(parts):
+                # Create node if it doesn't exist
+                if part not in current_target_node.children:
+                    current_target_node.children[part] = Node()
+                
+                # Logic to set obj/arr for parents based on structural presence.
+                # If a node now has children, it's an object (or contains an array if next is '*').
+                # Set obj/arr counter to 1 if it means it became a parent.
+                # This signifies structural integrity, but not sum of original occurrences.
+                # Start with if it's not the leaf itself
+                if i < len(parts) - 1: 
+                    next_part = parts[i+1]
+                    # If the next part implies an array element, mark parent as array container
+                    if next_part == '*' and current_target_node.counters['arr'] == 0:
+                        current_target_node.counters['arr'] = 1
+                    # Otherwise, if it's not array and current obj count is 0, mark parent as object container
+                    elif next_part != '*' and current_target_node.counters['obj'] == 0:
+                        current_target_node.counters['obj'] = 1
+
+                current_target_node = current_target_node.children[part]
+            
+            # At the leaf node, copy all its original counters directly
+            current_target_node.counters = source_node_for_leaf.counters.copy()
+        
+        # Ensure the overall root's obj count is consistent if it has children
+        new_guide._ensure_root_obj()
+        return new_guide
+    
+    def card(self, path=None):
+        """
+        Method to extract cardinality from data guide.
+        """
+        # If no path is input, compute cardinality of the root
+        if path is None:
+            node = self.root
+        else:
+            # Determine if the input path is a string or a Path object and convert if necessary
+            if isinstance(path, str):
+                path_obj = Path(path)
+            elif isinstance(path, Path):
+                path_obj = path
+            else:
+                # Raise an error for invalid input type
+                raise TypeError("Path must be a string or a Path object.")
+            # Traverse the input path to get the target node
+            node = self._traverse_path(path_obj)
+            # If the node holds no values, return an empty counters dictionary
+            if node is None:
+                return counters()
+        # Call _sum_counters method to get the total counts for the node and its subtree
+        return self._sum_counters(node)
+    
+    def _traverse_path(self, path_obj): 
+        """
+        Helper method to move through a path, starting at the root node 
+        and moving from child to child until path is complete or and end is reached
+        """
+        # If path_obj has no parts, it signifies the root
+        if not path_obj.get_parts(): 
+            return self.root
+        
+        current = self.root
+        # Iterate through each part of the path object
+        for part in path_obj.get_parts(): 
+            # If the part is a child of the current node
+            if part in current.children:
+                # Move to the child node
+                current = current.children[part]
+            else:
+                # If path part not found, return None
+                return None
+        # Return the final node at the end of the traversed path
+        return current
+    
+    def _gather_paths(self, node, current_path_obj=None):
+        """
+        Helper method used to get all leaf paths connected to input node that have data.
+        """
+        paths = []
+        # Create a starting path object for the current node's context
+        # This will be 'root' for the initial call, or the path to the current node in recursion
+        base_path = Path("") if current_path_obj is None else current_path_obj 
+
+        # Iterate over key-child pairs in the current node's children
+        for key, child in node.children.items():
+            new_path_obj = base_path.append(key) # Build the full path to this child
+            
+            # Check if the child node is a leaf (has no children) AND has data counters
+            if not child.children and sum(child.counters.values()) > 0:
+                paths.append(new_path_obj)
+            
+            # Recursively gather paths from the child node, extending the current path
+            paths.extend(self._gather_paths(child, new_path_obj))
+        return paths
+
+    def _path_contains_subpath(self, full_path_obj, sub_path_obj):
+        """
+        Checks if sub_path_obj exists as a contiguous sequence of parts anywhere within full_path_obj.
+        Example: _path_contains_subpath(Path('a.b.c.d'), Path('b.c')) -> True
+        Example: _path_contains_subpath(Path('a.b.c.d'), Path('x.y')) -> False
+        """
+        full_parts = full_path_obj.get_parts()
+        sub_parts = sub_path_obj.get_parts()
+
+        if not sub_parts: # An empty subpath is technically contained everywhere
+            return True 
+        if len(sub_parts) > len(full_parts):
+            return False
+
+        # Iterate through possible start positions in the full path
+        for i in range(len(full_parts) - len(sub_parts) + 1):
+            if full_parts[i:i + len(sub_parts)] == sub_parts:
+                return True
+        return False
+    
+    def _max_noncommon(self, all_paths, common_paths):
+        """
+        Helper method used to get maximum total sum of counters between all noncommon path nodes
+        """
+        # Variable to store the maximum total sum of counters
+        n = 0
+        # Iterate over paths that are in all_paths but not in common_paths
+        for path_obj in all_paths - common_paths:
+            # Get the node corresponding to the non-common path
+            node = self._traverse_path(path_obj)
+            # If a node exists
+            if node:
+                # Calculate the sum of all counter values for that node
+                total = sum(node.counters.values())
+                # If the current total is greater than the previously stored maximum, update n
+                if total > n: 
+                    n = total
+        return n
+    
+    def _ensure_root_obj(self):
+        """
+        Helper method to ensure object counter in root node is atleast one when child nodes are present
+        """
+        # If the root's object counter is zero but it has children
+        if self.root.counters['obj'] == 0 and self.root.children != {}:
+            # Set the root's object counter to 1
+            self.root.counters['obj'] = 1
+    
+    def search(self, path_input):
+        """
+        Search method, returns boolean based on if path is present in data guide
+        """
+        if isinstance(path_input, str):
+            path_obj = Path(path_input)
+        elif isinstance(path_input, Path):
+            path_obj = path_input
+        else:
+            # Raise an error for invalid input type
+            raise TypeError("Path must be a string or a Path object.")
+
+        # Traverse the path to find the corresponding node
+        node = self._traverse_path(path_obj)
+        # Return True if the node is found (path exists), False otherwise
+        return node is not None
+    
+    def nest_fields(self, parent_path_str, fields_to_nest_list, new_nested_key_name):
+        """
+        Nests a specific list of fields (and their sub-paths) under a new key.
+        The fields in `fields_to_nest_list` must be direct children of `parent_path_str`.
+        
+        Example: nest_fields("root.user", ["address", "contact"], "details")
+        'root.user.address.street' becomes 'root.user.details.address.street'
+        'root.user.name' remains 'root.user.name'
+        
+        Returns a new DataGuidePath object with the transformed schema.
+        
+        Note: 'obj' and 'arr' counters for intermediate nodes in the new guide
+        will reflect structural presence (i.e., at least 1 if they contain children/array elements)
+        rather than summed document occurrences, as the transformation operates on schema, not original documents.
+        Leaf node counters are preserved.
+        """
+        parent_path_obj = Path(parent_path_str)
+        
+        # Convert fields_to_nest_list to a set for efficient lookup
+        fields_to_nest_set = set(fields_to_nest_list)
+
+        path_node_map = {} # Map to store (transformed_path_obj: source_node)
+
+        # Iterate through all leaf paths from the original guide
+        all_original_paths = self._gather_paths(self.root)
+
+        for original_path_obj in all_original_paths:
+            source_node = self._traverse_path(original_path_obj)
+            if source_node is None: continue 
+
+            transformed_path_obj = original_path_obj
+
+            # Check if this original path is under the parent_path_str
+            if original_path_obj.starts_with(parent_path_obj):
+                # Get the part of the path immediately following the parent_path_str
+                # e.g., for original_path_obj="root.user.address.street", parent_path_obj="root.user"
+                # first_segment_after_parent would be "address"
+                parts_after_parent = original_path_obj.get_parts()[len(parent_path_obj.get_parts()):]
+                
+                if parts_after_parent: # Ensure there are parts after the parent path
+                    first_segment_after_parent = parts_after_parent[0]
+
+                    if first_segment_after_parent in fields_to_nest_set:
+                        # This path needs to be nested.
+                        # New path structure: parent_path + new_nested_key + (first_segment_after_parent + rest_of_parts)
+                        transformed_path = parent_path_obj.append(new_nested_key_name)
+                        for part in parts_after_parent: # Includes first_segment_after_parent itself
+                            transformed_path = transformed_path.append(part)
+                        transformed_path_obj = transformed_path
+            
+            path_node_map[transformed_path_obj] = source_node
+        
+        new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
+        new_guide.total_docs = self.total_docs 
+        return new_guide
+
+    def unnest_field(self, parent_path_str, field_to_unnest):
+        """
+        Unnests a specific field, lifting its children directly under its parent.
+        The `field_to_unnest` must be a direct child of `parent_path_str`.
+        
+        Example: unnest_field("root.user", "location")
+        'root.user.location.street' becomes 'root.user.street'
+        'root.user.name' remains 'root.user.name'
+
+        Returns a new DataGuidePath object with the transformed schema.
+        
+        Note: 'obj' and 'arr' counters for intermediate nodes in the new guide
+        will reflect structural presence (i.e., at least 1 if they contain children/array elements)
+        rather than summed document occurrences, as the transformation operates on schema, not original documents.
+        Leaf node counters are preserved.
+        """
+        parent_path_obj = Path(parent_path_str)
+        field_to_unnest_path_obj = parent_path_obj.append(field_to_unnest)
+
+        path_node_map = {} 
+
+        all_original_paths = self._gather_paths(self.root)
+
+        for original_path_obj in all_original_paths:
+            source_node = self._traverse_path(original_path_obj)
+            if source_node is None: continue 
+
+            transformed_path_obj = original_path_obj
+
+            # Check if this original path starts with the field_to_unnest_path_obj (i.e., is a child of it)
+            if original_path_obj.starts_with(field_to_unnest_path_obj):
+                # Get the suffix parts (i.e., parts after the field_to_unnest_path_obj)
+                # e.g., for original_path_obj="root.user.location.street", field_to_unnest_path_obj="root.user.location"
+                # suffix_parts would be ["street"]
+                suffix_parts = original_path_obj.get_parts()[len(field_to_unnest_path_obj.get_parts()):]
+                
+                # Build the new path: parent_path + suffix_parts
+                transformed_path = parent_path_obj
+                for part in suffix_parts:
+                    transformed_path = transformed_path.append(part)
+                transformed_path_obj = transformed_path
+            
+            path_node_map[transformed_path_obj] = source_node
+
+        new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
+        new_guide.total_docs = self.total_docs 
+        return new_guide
+
     def project(self, paths):
         """
         Return a new DataGuide with only the specified (possibly nested) paths.
         Includes parent nodes as needed. Updates total_docs to reflect the
         minimum number of documents that could contain all projected paths.
         """
-        new_guide = DataGuide()
+        #Create a new DataGuide object for the projection result
+        new_guide = DataGuidePath()
+        
+        #Initialize an empty list to store the sum of counts for each specified path
         min_counts = []
 
-        for path in paths:
-            #Check if full path exists
-            source_leaf = self._traverse_path(path)
+        #Iterate through each path provided in the 'paths' list
+        for path_input in paths: 
+            #Determine if the input is a string or a Path object and convert if necessary
+            if isinstance(path_input, str):
+                path_obj = Path(path_input)
+            elif isinstance(path_input, Path):
+                path_obj = path_input
+            else:
+                #Raise an error for invalid input type
+                raise TypeError("Each path in the list must be a string or a Path object.")
+
+            #Attempt to traverse the current path in the original DataGuide(self)
+            source_leaf = self._traverse_path(path_obj) 
+            
+            #If the path does not exist, skip it and move to the next path
             if source_leaf is None:
-                #Skip nonexistent paths
                 continue  
-            #Track the total count for this path
+            
+            #Sum all counter values for the 'source_leaf' node and append to min_counts
             min_counts.append(sum(source_leaf.counters.values()))
 
-            #Traverse parts of the path
-            parts = path.split(".")
+            #Initialize 'source_node' to the root of the original DataGuide.
             source_node = self.root
+            
+            #Initialize 'target_node' to the root of the 'new_guide' (the projected DataGuide).
             target_node = new_guide.root
 
-            for part in parts:
+            #Iterate through each segment (part) of the current path.
+            for part in path_obj.get_parts(): 
+                #Check if the current 'part' exists as a child in the 'source_node'
                 if part not in source_node.children:
+                    #If it doesn't exist, it means the path was incomplete or incorrect
                     break
 
+                #If the current 'part' does not exist as a child in the 'target_node', create a new Node for it.
                 if part not in target_node.children:
                     target_node.children[part] = Node()
 
+                #Move 'source_node' down to its child corresponding to 'part'
                 source_node = source_node.children[part]
+                
+                #Move 'target_node' down to its newly created or existing child corresponding to 'part'
                 target_node = target_node.children[part]
 
-                #Copy counters at every level
+                #Copy the counters from the 'source_node' to the 'target_node'
                 target_node.counters = source_node.counters.copy()
 
-        #Conservative max total docs that might have any of the paths
+        #Calculate the sum of all counts collected for the specified paths
         sum_counts = sum(min_counts)
+        
+        #Set the 'total_docs' for the new projected DataGuide
         new_guide.total_docs = min(self.total_docs, sum_counts)
+        
+        #Return the newly created DataGuide
         return new_guide
-
-
     def intersect(self, other):
         """
         Method to intersect two dataguides, as if an intersection was performed on original JSON documents
@@ -565,15 +929,15 @@ class DataGuide:
             m_int = 0
         
         #Create resulting dataguide and set total documents
-        result = DataGuide()
+        result = DataGuidePath()
         result.total_docs = m_int
 
-        #Iterate over common paths
-        for path in sorted(common_paths):
-            #Get nodes of paths
-            n1_node = self._traverse_path(path)
-            n2_node = other._traverse_path(path)
-            #Comb dictionary used to combine common path counts
+        #Iterate over common paths, sorted by their string representation
+        for path_obj in sorted(common_paths, key=str):
+            #Get nodes of paths from both guides
+            n1_node = self._traverse_path(path_obj) 
+            n2_node = other._traverse_path(path_obj)
+            #Dictionary used to combine common path counts
             comb = {}
             #Iterate over counters in nodes
             for t in set(n1_node.counters) | set(n2_node.counters):
@@ -593,59 +957,197 @@ class DataGuide:
             if sum(comb.values()) == 0:
                 continue
 
-            #Set current node to root
+            #Set current node to root of the result guide
             current = result.root
-            #iterate over path nodes
-            for part in path.split('.'):
-                #Create new child node for current node
+            #Iterate over path parts
+            for part in path_obj.get_parts(): 
+                #Create new child node for current node if not already present
                 current = current.children.setdefault(part, Node())
-            #Set counters of current node to comb dictionary
+            #Set counters of current node to the combined counts
             current.counters = comb
-        #Set root object counter to number of unqiue documents
+        #Set root object counter to number of unique documents in the intersection
         result.root.counters['obj'] = m_int
-        #Ensure root object counter has at least one node
+        #Ensure root object counter has at least one node if there are children
         result._ensure_root_obj()
         
-        return result
+        return result  
     
-    def _gather_paths(self, node, prefix=""):
+    def nest_by_grouping_keys(self, grouping_keys, new_nested_key_name, include_partial_or_null=False):
         """
-        Helper method used to get all paths connected to input node
+        Nests paths based on the presence of a set of 'grouping_keys' under a 'new_nested_key_name'.
+        A path is considered for nesting if any part of its full path contains a grouping key.
+        
+        Args:
+            grouping_keys (list of str or Path): A list of paths (or string representations of paths)
+                                                  that define the grouping criteria. These paths can
+                                                  exist anywhere within the full path.
+            new_nested_key_name (str): The name of the new key under which the grouped paths will be nested.
+            include_partial_or_null (bool): If True, a "null" or "partial" grouping bucket will be created
+                                            for paths that do not contain any specified grouping keys.
+                                            This bucket will be named '_partial_or_null_group'.
+
+        Returns:
+            tuple: A tuple containing:
+                - DataGuidePath: A new DataGuidePath object with the transformed schema.
+                - dict: A report on grouping key presence, including estimations for impacted documents:
+                    {
+                        "total_documents_in_guide": int,
+                        "max_impacted_documents_estimate": int, # All documents in the guide
+                        "min_exact_grouping_keys_present_estimate": int, # Documents containing all specified grouping keys (at their exact paths)
+                        "estimated_documents_with_primary_and_fuzzy_subpath": int, # (Only if 2 grouping keys provided) Estimates docs with 1st key AND (any path containing 2nd key)
+                        "grouping_key_presence_counts": { # How many times each exact grouping key path appears in the guide (from root)
+                            "path_str": int,
+                            ...
+                        }
+                    }
+        
+        Note: 'obj' and 'arr' counters for intermediate nodes in the new guide
+        will reflect structural presence (i.e., at least 1 if they contain children/array elements)
+        rather than summed document occurrences, as this operation reshapes the schema conceptually.
+        Leaf node counters are preserved, but their 'document count' meaning changes with grouping.
         """
-        #Create paths list
-        paths = []
-        #Iterate over key value pairs of child nodes
-        for key, child in node.children.items():
-            #Add key to path, if prefix is present then add prefix with new key added
-            path = key if not prefix else prefix + "." + key
-            #Add path to paths list
-            paths.append(path)
-            #Recursive call with child node and prefix
-            paths.extend(self._gather_paths(child, path))
-        return paths
-    
-    def _max_noncommon(self, all_paths, common_paths):
-        """
-        Helper method used to get maximum total sum of counters between all noncommon path nodes
-        """
-        #n used to store maximum total sum of counters
-        n = 0
-        #Iterate over noncommon paths
-        for path in all_paths - common_paths:
-            #Get nodes of noncommon paths
-            node = self._traverse_path(path)
-            #If node is returned
+        if not grouping_keys:
+            raise ValueError("grouping_keys cannot be empty.")
+        if not new_nested_key_name:
+            raise ValueError("new_nested_key_name cannot be empty.")
+
+        # Convert grouping_keys to Path objects for consistency
+        grouping_key_paths = []
+        for key in grouping_keys:
+            if isinstance(key, str):
+                grouping_key_paths.append(Path(key))
+            elif isinstance(key, Path):
+                grouping_key_paths.append(key)
+            else:
+                raise TypeError("Each grouping key must be a string or a Path object.")
+
+        transformed_path_node_map = {} 
+        all_original_paths = self._gather_paths(self.root)
+        
+        for original_path_obj in all_original_paths:
+            source_node = self._traverse_path(original_path_obj)
+            if source_node is None: continue 
+
+            should_nest_this_path = False
+            for gp_obj in grouping_key_paths:
+                # Use the new helper function to check if the grouping key is contained anywhere in the path
+                if self._path_contains_subpath(original_path_obj, gp_obj):
+                    should_nest_this_path = True
+                    break
+            
+            transformed_path_obj = None
+            if should_nest_this_path:
+                # The entire original_path_obj is moved under new_nested_key_name
+                transformed_path = Path(new_nested_key_name)
+                for part in original_path_obj.get_parts():
+                    transformed_path = transformed_path.append(part)
+                transformed_path_obj = transformed_path
+            else:
+                if include_partial_or_null:
+                    transformed_path = Path("_partial_or_null_group")
+                    for part in original_path_obj.get_parts():
+                        transformed_path = transformed_path.append(part)
+                    transformed_path_obj = transformed_path
+                else:
+                    transformed_path_obj = original_path_obj
+            
+            if transformed_path_obj:
+                transformed_path_node_map[transformed_path_obj] = source_node
+
+        new_guide = self._rebuild_guide_from_path_node_map(transformed_path_node_map)
+        new_guide.total_docs = self.total_docs
+
+        # --- Report Generation ---
+        max_impacted_documents_estimate = self.total_docs
+
+        # Metric for documents with ALL exact grouping keys
+        min_exact_grouping_keys_present_estimate = 0 
+        if grouping_key_paths:
+            projected_total_docs_list = []
+            for gp_obj in grouping_key_paths:
+                proj_guide = self.project([gp_obj])
+                projected_total_docs_list.append(proj_guide.total_docs)
+            
+            if projected_total_docs_list:
+                min_exact_grouping_keys_present_estimate = min(projected_total_docs_list)
+        
+        # New complex metric: Estimated documents with primary_key AND (any path containing fuzzy_subpath_obj)
+        estimated_documents_with_primary_and_fuzzy_subpath = None
+        if len(grouping_key_paths) == 2: # This metric applies specifically to 2 grouping keys
+            primary_key = grouping_key_paths[0]
+            fuzzy_subpath = grouping_key_paths[1]
+            estimated_documents_with_primary_and_fuzzy_subpath = self._estimate_documents_with_subpath_intersection_union(primary_key, fuzzy_subpath)
+
+        report = {
+            "total_documents_in_guide": self.total_docs,
+            "max_impacted_documents_estimate": max_impacted_documents_estimate,
+            "min_exact_grouping_keys_present_estimate": min_exact_grouping_keys_present_estimate,
+            "grouping_key_presence_counts": {}, # Exact path presence count
+        }
+
+        # Add the new complex metric to the report if it was calculated
+        if estimated_documents_with_primary_and_fuzzy_subpath is not None:
+            report["estimated_documents_with_primary_and_fuzzy_subpath"] = estimated_documents_with_primary_and_fuzzy_subpath
+        
+        for gp_obj in grouping_key_paths:
+            node = self._traverse_path(gp_obj)
             if node:
-                #Sum all counter values
-                total = sum(node.counters.values())
-                #If current total is bigger than previous max, replace n
-                if total > n: 
-                    n = total
-        return n
+                report["grouping_key_presence_counts"][str(gp_obj)] = sum(node.counters.values())
+            else:
+                report["grouping_key_presence_counts"][str(gp_obj)] = 0
+        
+        return new_guide, report
+
+    def _estimate_documents_with_subpath_intersection_union(self, primary_key_obj, fuzzy_subpath_obj):
+        """
+        Estimates the number of documents that contain the primary_key_obj
+        AND any path that contains the fuzzy_subpath_obj.
+        This approximates: (|Project(primary_key) INTERSECT Project(fuzzy_path_1)|) UNION (|Project(primary_key) INTERSECT Project(fuzzy_path_2)|) ...
+        where fuzzy_path_N are all actual leaf paths in the guide containing fuzzy_subpath_obj.
+        """
+        if not isinstance(primary_key_obj, Path) or not isinstance(fuzzy_subpath_obj, Path):
+            raise TypeError("Both primary_key_obj and fuzzy_subpath_obj must be Path objects.")
+
+        all_original_leaf_paths = self._gather_paths(self.root)
+        
+        # Find all actual leaf paths in the guide that contain the fuzzy_subpath_obj
+        actual_paths_containing_fuzzy_subpath = []
+        for leaf_path_obj in all_original_leaf_paths:
+            if self._path_contains_subpath(leaf_path_obj, fuzzy_subpath_obj):
+                actual_paths_containing_fuzzy_subpath.append(leaf_path_obj)
+        
+        # Project the primary key once
+        proj_primary_key_guide = self.project([primary_key_obj])
+
+        estimated_union_total_docs = 0
+        
+        # To avoid overcounting in the 'union' for documents that might satisfy multiple intersections,
+        # we need a way to track unique documents or use a more sophisticated union estimation.
+        # For the specific (A AND B.C) OR (A AND COMMON.B.C) case where B.C and COMMON.B.C are disjoint,
+        # simple summation is acceptable. For more complex overlaps, this would need refinement.
+        
+        # We will sum the estimated intersection counts for each pair.
+        # This implicitly assumes the document sets for each (primary_key, actual_fuzzy_path) pair are mostly disjoint,
+        # or it will overestimate the true union. In the (a, b.c) and (a, common.b.c) case, this works.
+        for actual_fuzzy_path_obj in actual_paths_containing_fuzzy_subpath:
+            # Project the current actual fuzzy path
+            proj_actual_fuzzy_guide = self.project([actual_fuzzy_path_obj])
+            
+            # Get the estimated intersection count using the intuitive helper
+            estimated_intersection_for_pair = self._get_intuitive_intersection_docs_count(
+                proj_primary_key_guide, proj_actual_fuzzy_guide
+            )
+            
+            estimated_union_total_docs += estimated_intersection_for_pair
+            
+        return estimated_union_total_docs
     
-    def _ensure_root_obj(self):
+    def _get_intuitive_intersection_docs_count(self, guide1, guide2):
         """
-        Helper method to ensure object counter in root node is atleast one when child nodes are present
+        Helper to provide a more intuitive document intersection count for potentially disjoint schema paths.
+        It estimates the intersection as the minimum of the total_docs of the two guides.
+        This is a heuristic when precise overlap cannot be determined from schema alone.
         """
-        if self.root.counters['obj'] == 0 and self.root.children != {}:
-            self.root.counters['obj'] = 1
+        # This estimate is based on the principle that the number of documents containing both sets of paths
+        # cannot exceed the number of documents in the smaller of the two guides (assuming projection correctly sets total_docs).
+        return min(guide1.total_docs, guide2.total_docs)
