@@ -1844,7 +1844,7 @@ class DataGuidePath:
         """
         if not isinstance(other, DataGuidePath):
             raise TypeError("other must be a DataGuidePath")
-        if mode not in ("lower_bound", "upper_bound", "mid"):
+        if mode not in ("lower_bound", "upper_bound", "mid", "recommend"):
             raise ValueError("mode must be one of: 'lower_bound','upper_bound','mid'")
 
        
@@ -1884,12 +1884,46 @@ class DataGuidePath:
         else:
             ub = self.total_docs
 
-        if mode == "lower_bound":
+        if mode == "recommend":
+            # Build soft cores for both dataguides
+            core_self = self.soft_core(threshold=0.7)
+            core_other = other.soft_core(threshold=0.7)
+
+            core_self_paths = set(core_self._path_set())
+            core_other_paths = set(core_other._path_set())
+
+            if core_self_paths and core_other_paths:
+                intersection = core_self_paths & core_other_paths
+                overlap_self = len(intersection) / len(core_self_paths)
+                overlap_other = len(intersection) / len(core_other_paths)
+
+                # Weight by total_docs to avoid bias if one DG is much smaller
+                total_self = getattr(self, "total_docs", 1)
+                total_other = getattr(other, "total_docs", 1)
+                overlap = (
+                    overlap_self * total_self + overlap_other * total_other
+                ) / (total_self + total_other)
+            else:
+                overlap = 0.0
+
+            # Choose mode adaptively
+            if overlap >= 0.3:
+                chosen_mode = "lower_bound"
+            else:
+                chosen_mode = "upper_bound"
+
+            # print(f"[recommend] Soft Core overlap: {overlap:.2%} → using {chosen_mode} mode") # Can use for seeing what the overlap was
+
+            # Recurse into same function with the chosen mode
+            return self.difference_beta(other, mode=chosen_mode)
+
+        elif mode == "lower_bound":
             est = lb
         elif mode == "upper_bound":
             est = ub
         else:  # mid
             est = (lb + ub + 1) // 2
+
 
         est = max(0, est)
 
@@ -2002,7 +2036,41 @@ class DataGuidePath:
                 counts.append(self._doc_count_for_node(n))
         return counts
 
+    # TESTING TWO FUNCTION FOR DIFFERENCE_BETA
+    def soft_core(self, threshold=0.9):
+        """
+        Return a DataGuidePath representing a 'soft core' —
+        paths that appear in at least threshold * total_docs of this DataGuide.
+        Uses _doc_count_for_node to estimate per-path document presence.
+        """
+        soft_core_guide = DataGuidePath()
+        soft_core_guide.total_docs = self.total_docs
+        soft_core_guide.root = self._extract_soft_core(self.root, threshold)
+        return soft_core_guide
 
+
+    def _extract_soft_core(self, node, threshold):
+        """
+        Recursive helper for soft_core().
+        A node is retained if it appears in >= threshold * total_docs documents.
+        """
+        if node is None or self.total_docs == 0:
+            return None
+
+        min_docs = max(1, int(self.total_docs * threshold))
+        count = self._doc_count_for_node(node)
+        if count < min_docs:
+            return None
+
+        new_node = Node()
+        new_node.counters = node.counters.copy()
+
+        for key, child in node.children.items():
+            soft_child = self._extract_soft_core(child, threshold)
+            if soft_child is not None:
+                new_node.children[key] = soft_child
+
+        return new_node if new_node.counters or new_node.children else None
 
 
         
