@@ -269,6 +269,97 @@ class DataGuidePath:
         for doc in docs:
             _handle(doc)
 
+    # Being used to test if tracking values is feasible and adds value to DG
+    def insert_document_with_values(self, *docs, MAX_UNIQUE=1000):
+        """
+        Insert one or more documents and tracks distinct values.
+        Tracks up to MAX_UNIQUE unique values per path. If exceeded, stops tracking for that path.
+        """
+
+        if not hasattr(self, "_array_lengths"):
+            self._array_lengths = {}
+
+        if not hasattr(self, "_value_counters"):
+            self._value_counters = {}
+
+        if not hasattr(self, "_high_cardinality"):
+            self._high_cardinality = set()
+
+        def _track_value(path, value):
+            if path in self._high_cardinality:
+                return  # already too many distinct values, thus skip it
+
+            # Get or create the sub-dictionary for this path inside _value_counters
+            counter = self._value_counters.setdefault(path, {})
+
+            # Convert lists/dicts to a hashable type (for sets) since they arent hashable
+            if isinstance(value, (list, dict)):
+                value = str(value)
+
+            if len(counter) < MAX_UNIQUE or value in counter:
+                counter[value] = counter.get(value, 0) + 1
+            else:
+                # Too many unique values — add to high card, then mark as high cardinality
+                self._high_cardinality.add(path)
+                self._value_counters[path] = None
+
+        # Recursive function that walks the JSON object, discovers all paths and values
+        def _handle_value(node, obj, current_path="root"):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    path = f"{current_path}.{k}"
+                    _track_value(path, v)
+                    _handle_value(node.children[k], v, path)
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    path = f"{current_path}.*"
+                    _track_value(path, item)
+                    _handle_value(node.children["*"], item, path)
+
+        # Main helper function to handle inserting, walks documents, 
+        # tracking array lengths, inserting value, and recording distinct value
+        def _handle(doc):
+            if isinstance(doc, dict):
+                self.total_docs += 1
+                self._track_array_lengths(doc)
+                self._insert_value(self.root, doc)
+                _handle_value(self.root, doc)
+            elif isinstance(doc, list):
+                for item in doc:
+                    _handle(item)
+            else:
+                raise ValueError(f"Unsupported document type: {type(doc)}. Expected dict or list.")
+
+        # Main loop
+        for doc in docs:
+            _handle(doc)
+
+    # Being used to print new insert function which tracks values
+    def print_guide_values(self):
+        """
+        Prints the DataGuide structure along with tracked distinct values.
+        """
+        def _print_node(node, path="root"):
+            # Base counters
+            print(f"{path}: {node.counters}")
+
+            # Distinct value tracking
+            if hasattr(self, "_value_counters") and path in self._value_counters:
+                val_info = self._value_counters[path]
+                if val_info is None:
+                    print(f" [high-cardinality: >1000 unique values]")
+                elif len(val_info) > 0:
+                    top_values = sorted(val_info.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                    print(f" Distinct values (top 5 of {len(val_info)}): {top_values}")
+            elif hasattr(self, "_high_cardinality") and path in self._high_cardinality:
+                print(f" [high-cardinality detected]")
+
+            # Recurse
+            for key, child in node.children.items():
+                _print_node(child, f"{path}.{key}")
+
+        _print_node(self.root)
+
 
     def _track_array_lengths(self, doc):
         """
@@ -659,6 +750,83 @@ class DataGuidePath:
         new_guide = self._rebuild_guide_from_path_node_map(path_node_map)
         new_guide.total_docs = self.total_docs
         return new_guide
+    
+    def nest_schema_w_values(self, grouping_paths=None, nest_specs=None, aggregations=None, max_values=5):
+        """
+        Value-aware version of `nest_schema()`.
+        Builds the same nested structure but also overlays value summaries from _value_counters.
+
+        Parameters:
+        grouping_paths : list[str] or list[Path]
+            Paths to group by (e.g., ["average_stars"])
+        nest_specs : list[tuple[str, list[str]]]
+            New paths and their grouped field paths (same as `nest_schema`)
+        aggregations : optional
+            ******Currently unused (for future sum/count aggregation extensions)*******
+        max_values : int
+            Max number of distinct values to show per field in the summary
+        """
+
+        #1. Build the structural part using the original nest_schema
+        structural_guide = self.nest_schema(
+            grouping_paths=grouping_paths,
+            nest_specs=nest_specs,
+            aggregations=aggregations,
+        )
+
+        #2. Clone counters and attach value info
+        value_aware_guide = DataGuidePath()
+        value_aware_guide.total_docs = self.total_docs
+
+        # Copying over root node structure
+        def _copy_node_with_values(src_node, dst_node, current_path="root"):
+            # Copy type counters (like 'int', etc.)
+            dst_node.counters = dict(src_node.counters)
+
+            # Attach top distinct values
+            if hasattr(self, "_value_counters") and current_path in self._value_counters:
+                values = self._value_counters[current_path]
+                if isinstance(values, dict):
+                    top_values = sorted(values.items(), key=lambda x: x[1], reverse=True)[:max_values]
+                    dst_node.value_summary = {
+                        "num_distinct": len(values),
+                        "top_values": top_values
+                    }
+                elif values is None:
+                    dst_node.value_summary = {"high_cardinality": True}
+
+            # Recursively copy children
+            for child_key, src_child in src_node.children.items():
+                dst_child = Node()
+                dst_node.children[child_key] = dst_child
+                _copy_node_with_values(src_child, dst_child, f"{current_path}.{child_key}")
+
+        _copy_node_with_values(structural_guide.root, value_aware_guide.root)
+
+        #3. Pretty print method
+        def _print_guide_values(node, path="root", indent=0):
+            prefix = " " * indent
+            counter_str = f"{node.counters}" if node.counters else "{}"
+
+            # Print counters
+            print(f"{prefix}{path}: {counter_str}")
+
+            # Print value summaries
+            if hasattr(node, "value_summary"):
+                vs = node.value_summary
+                if "high_cardinality" in vs:
+                    print(f"{prefix}  [high-cardinality: >{max_values} unique values]")
+                else:
+                    top_vals = vs["top_values"]
+                    print(f"{prefix}  Distinct values (top {len(top_vals)} of {vs['num_distinct']}): {top_vals}")
+
+            for k, v in node.children.items():
+                _print_guide_values(v, f"{path}.{k}", indent + 2)
+
+        value_aware_guide.print_guide_values = lambda: _print_guide_values(value_aware_guide.root)
+
+        return value_aware_guide
+
     
     def nest_schema(self, grouping_paths=None, nest_specs=None, aggregations=None, new_path_for_others=None):
         """
@@ -1844,7 +2012,7 @@ class DataGuidePath:
         """
         if not isinstance(other, DataGuidePath):
             raise TypeError("other must be a DataGuidePath")
-        if mode not in ("lower_bound", "upper_bound", "mid", "recommend"):
+        if mode not in ("lower_bound", "upper_bound", "mid", "recommend", "recommend2", "recommend3"):
             raise ValueError("mode must be one of: 'lower_bound','upper_bound','mid'")
 
        
@@ -1885,9 +2053,8 @@ class DataGuidePath:
             ub = self.total_docs
 
         if mode == "recommend":
-            # Build soft cores for both dataguides
-            core_self = self.soft_core(threshold=0.7)
-            core_other = other.soft_core(threshold=0.7)
+            core_self = self.soft_core(threshold=0.80)
+            core_other = other.soft_core(threshold=0.80)
 
             core_self_paths = set(core_self._path_set())
             core_other_paths = set(core_other._path_set())
@@ -1897,7 +2064,6 @@ class DataGuidePath:
                 overlap_self = len(intersection) / len(core_self_paths)
                 overlap_other = len(intersection) / len(core_other_paths)
 
-                # Weight by total_docs to avoid bias if one DG is much smaller
                 total_self = getattr(self, "total_docs", 1)
                 total_other = getattr(other, "total_docs", 1)
                 overlap = (
@@ -1906,16 +2072,60 @@ class DataGuidePath:
             else:
                 overlap = 0.0
 
-            # Choose mode adaptively
-            if overlap >= 0.3:
-                chosen_mode = "lower_bound"
+            if overlap >= 0.80:
+                est = lb
             else:
-                chosen_mode = "upper_bound"
+                est = ub
 
-            # print(f"[recommend] Soft Core overlap: {overlap:.2%} → using {chosen_mode} mode") # Can use for seeing what the overlap was
+        elif mode == "recommend2":
+            core_self = self.soft_core(threshold=0.10)
+            core_other = other.soft_core(threshold=0.10)
 
-            # Recurse into same function with the chosen mode
-            return self.difference_beta(other, mode=chosen_mode)
+            core_self_paths = set(core_self._path_set())
+            core_other_paths = set(core_other._path_set())
+
+            if core_self_paths and core_other_paths:
+                intersection = core_self_paths & core_other_paths
+                overlap_self = len(intersection) / len(core_self_paths)
+                overlap_other = len(intersection) / len(core_other_paths)
+
+                total_self = getattr(self, "total_docs", 1)
+                total_other = getattr(other, "total_docs", 1)
+                overlap = (
+                    overlap_self * total_self + overlap_other * total_other
+                ) / (total_self + total_other)
+            else:
+                overlap = 0.0
+
+            if overlap >= 0.10:
+                est = lb
+            else:
+                est = ub
+        
+        elif mode == "recommend3":
+            # Build soft cores for both dataguides
+            core_self = self.soft_core(threshold=0.25)
+            core_other = other.soft_core(threshold=0.25)
+
+            core_self_paths = set(core_self._path_set())
+            core_other_paths = set(core_other._path_set())
+
+            if core_self_paths and core_other_paths:
+                intersection = core_self_paths & core_other_paths
+                overlap_self = len(intersection) / max(len(core_self_paths), 1)
+                overlap_other = len(intersection) / max(len(core_other_paths), 1)
+
+                # Weighted average overlap by total_docs
+                total_self = getattr(self, "total_docs", 1)
+                total_other = getattr(other, "total_docs", 1)
+                overlap = (overlap_self * total_self + overlap_other * total_other) / (total_self + total_other)
+            else:
+                overlap = 0.0
+
+            # Robust estimate: scale between lb and ub according to overlap
+            est = int(lb + (1 - overlap) * (ub - lb) * (self.total_docs / max(self.total_docs, other.total_docs)))
+
+            est = max(0, est)
 
         elif mode == "lower_bound":
             est = lb
