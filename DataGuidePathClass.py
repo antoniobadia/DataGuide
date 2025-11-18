@@ -751,43 +751,46 @@ class DataGuidePath:
         new_guide.total_docs = self.total_docs
         return new_guide
     
-    def nest_schema_w_values(self, grouping_paths=None, nest_specs=None, aggregations=None, max_values=5):
+    def nest_schema_w_values(self, grouping_paths=None, nest_specs=None, aggregations=None):
         """
-        Value-aware version of `nest_schema()`.
-        Builds the same nested structure but also overlays value summaries from _value_counters.
-
-        Parameters:
-        grouping_paths : list[str] or list[Path]
-            Paths to group by (e.g., ["average_stars"])
-        nest_specs : list[tuple[str, list[str]]]
-            New paths and their grouped field paths (same as `nest_schema`)
-        aggregations : optional
-            ******Currently unused (for future sum/count aggregation extensions)*******
-        max_values : int
-            Max number of distinct values to show per field in the summary
+        Value-aware version of nest_schema() that propagates distinct values from original paths
+        to any nested paths created by nest_specs.
         """
 
-        #1. Build the structural part using the original nest_schema
+        # 1. Build structural guide using original nest_schema
         structural_guide = self.nest_schema(
             grouping_paths=grouping_paths,
             nest_specs=nest_specs,
             aggregations=aggregations,
         )
 
-        #2. Clone counters and attach value info
+        # 2. Create a new DataGuidePath for value-aware copy
         value_aware_guide = DataGuidePath()
         value_aware_guide.total_docs = self.total_docs
 
-        # Copying over root node structure
+        # Helper: build a mapping of nested paths to original source paths
+        nested_to_source = {}
+        if nest_specs and hasattr(self, "_value_counters"):
+            for new_parent, fields in nest_specs:
+                for field in fields:
+                    # e.g., fans → root.fans
+                    for src_path in self._value_counters:
+                        if src_path.endswith(field):
+                            nested_path = f"root.{new_parent}.*.{field}"
+                            nested_to_source[nested_path] = src_path
+
+        # Recursive copy with value summary
         def _copy_node_with_values(src_node, dst_node, current_path="root"):
-            # Copy type counters (like 'int', etc.)
             dst_node.counters = dict(src_node.counters)
 
-            # Attach top distinct values
-            if hasattr(self, "_value_counters") and current_path in self._value_counters:
-                values = self._value_counters[current_path]
+            # Determine the source path to use for value summary
+            source_path = nested_to_source.get(current_path, current_path)
+
+            # Attach value summary if available
+            if hasattr(self, "_value_counters") and source_path in self._value_counters:
+                values = self._value_counters[source_path]
                 if isinstance(values, dict):
-                    top_values = sorted(values.items(), key=lambda x: x[1], reverse=True)[:max_values]
+                    top_values = sorted(values.items(), key=lambda x: x[1], reverse=True)[:]
                     dst_node.value_summary = {
                         "num_distinct": len(values),
                         "top_values": top_values
@@ -795,7 +798,7 @@ class DataGuidePath:
                 elif values is None:
                     dst_node.value_summary = {"high_cardinality": True}
 
-            # Recursively copy children
+            # Recurse into children
             for child_key, src_child in src_node.children.items():
                 dst_child = Node()
                 dst_node.children[child_key] = dst_child
@@ -803,30 +806,64 @@ class DataGuidePath:
 
         _copy_node_with_values(structural_guide.root, value_aware_guide.root)
 
-        #3. Pretty print method
-        def _print_guide_values(node, path="root", indent=0):
+        return value_aware_guide
+
+    def print_guide_values(self, max_values=5):
+        """
+        Recursively prints the guide's counters and top distinct values.
+        """
+
+        def _print_node(node, path="root", indent=0):
             prefix = " " * indent
-            counter_str = f"{node.counters}" if node.counters else "{}"
+            print(f"{prefix}{path}: {node.counters}")
 
-            # Print counters
-            print(f"{prefix}{path}: {counter_str}")
-
-            # Print value summaries
             if hasattr(node, "value_summary"):
                 vs = node.value_summary
                 if "high_cardinality" in vs:
                     print(f"{prefix}  [high-cardinality: >{max_values} unique values]")
                 else:
-                    top_vals = vs["top_values"]
+                    top_vals = vs["top_values"][:max_values]
                     print(f"{prefix}  Distinct values (top {len(top_vals)} of {vs['num_distinct']}): {top_vals}")
 
             for k, v in node.children.items():
-                _print_guide_values(v, f"{path}.{k}", indent + 2)
+                _print_node(v, path=f"{path}.{k}", indent=indent + 2)
 
-        value_aware_guide.print_guide_values = lambda: _print_guide_values(value_aware_guide.root)
+        _print_node(self.root)
 
-        return value_aware_guide
+    
+    def list_paths_with_counts(self, include_values=False, max_values=5):
+        """
+        Walk the dataguide and return all paths with their counters.
+        Optionally include top distinct values if available.
+        Returns a list of tuples: (path_str, counters, value_summary)
+        """
+        paths = []
 
+        def recurse(node, path="root"):
+            entry = {
+                "counters": dict(node.counters)
+            }
+            if include_values and hasattr(node, "value_summary"):
+                vs = node.value_summary
+                if "high_cardinality" in vs:
+                    entry["value_summary"] = {"high_cardinality": True}
+                else:
+                    top_vals = vs.get("top_values", [])[:max_values]
+                    entry["value_summary"] = {
+                        "num_distinct": vs.get("num_distinct", 0),
+                        "top_values": top_vals
+                    }
+
+            paths.append((path, entry))
+
+            for k, child in node.children.items():
+                child_path = f"{path}.{k}" if path else k
+                recurse(child, child_path)
+
+        recurse(self.root)
+        return paths
+
+    
     
     def nest_schema(self, grouping_paths=None, nest_specs=None, aggregations=None, new_path_for_others=None):
         """
