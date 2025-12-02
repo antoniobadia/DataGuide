@@ -334,31 +334,7 @@ class DataGuidePath:
         for doc in docs:
             _handle(doc)
 
-    # Being used to print new insert function which tracks values
-    def print_guide_values(self):
-        """
-        Prints the DataGuide structure along with tracked distinct values.
-        """
-        def _print_node(node, path="root"):
-            # Base counters
-            print(f"{path}: {node.counters}")
-
-            # Distinct value tracking
-            if hasattr(self, "_value_counters") and path in self._value_counters:
-                val_info = self._value_counters[path]
-                if val_info is None:
-                    print(f" [high-cardinality: >1000 unique values]")
-                elif len(val_info) > 0:
-                    top_values = sorted(val_info.items(), key=lambda kv: kv[1], reverse=True)[:5]
-                    print(f" Distinct values (top 5 of {len(val_info)}): {top_values}")
-            elif hasattr(self, "_high_cardinality") and path in self._high_cardinality:
-                print(f" [high-cardinality detected]")
-
-            # Recurse
-            for key, child in node.children.items():
-                _print_node(child, f"{path}.{key}")
-
-        _print_node(self.root)
+    
 
 
     def _track_array_lengths(self, doc):
@@ -751,6 +727,37 @@ class DataGuidePath:
         new_guide.total_docs = self.total_docs
         return new_guide
     
+    # HELPER TEMP FUNCTION
+    def count_subpaths(self, base_path="root", recursive=False):
+        
+        # Helper to locate the node
+        def _get_node(node, path_parts):
+            if not path_parts:
+                return node
+            part = path_parts[0]
+            if part in node.children:
+                return _get_node(node.children[part], path_parts[1:])
+            else:
+                return None
+
+        parts = base_path.split(".")
+        node = _get_node(self.root, parts[1:]) 
+        if not node:
+            return 0
+
+        if recursive:
+            # count all descendants
+            def _count_descendants(n):
+                total = len(n.children)
+                for child in n.children.values():
+                    total += _count_descendants(child)
+                return total
+            return _count_descendants(node)
+        else:
+            # only immediate children
+            return len(node.children)
+
+
     def nest_schema_w_values(self, grouping_paths=None, nest_specs=None, aggregations=None):
         """
         Value-aware version of nest_schema() that propagates distinct values from original paths
@@ -806,29 +813,390 @@ class DataGuidePath:
 
         _copy_node_with_values(structural_guide.root, value_aware_guide.root)
 
+        # Adding object counter, conservitive, multiplies distinct group counts
+        if grouping_paths and hasattr(self, "_value_counters"):
+            est_groups = 1
+            for path in grouping_paths:
+                src_path = f"root.{path}"  
+                if src_path in self._value_counters and isinstance(self._value_counters[src_path], dict):
+                    est_groups *= len(self._value_counters[src_path])
+            value_aware_guide.root.counters["obj"] = est_groups
+
+
         return value_aware_guide
+
+    # Works when passing param max_values
+    # def print_guide_values(self, max_values=5):
+    #     """
+    #     Recursively prints the guide's counters and top distinct values.
+    #     """
+
+    #     def _print_node(node, path="root", indent=0):
+    #         prefix = " " * indent
+    #         print(f"{prefix}{path}: {node.counters}")
+
+    #         if hasattr(node, "value_summary"):
+    #             vs = node.value_summary
+    #             if "high_cardinality" in vs:
+    #                 print(f"{prefix}  [high-cardinality: >{max_values} unique values]")
+    #             else:
+    #                 top_vals = vs["top_values"][:max_values]
+    #                 print(f"{prefix}  Distinct values (top {len(top_vals)} of {vs['num_distinct']}): {top_vals}")
+
+    #         for k, v in node.children.items():
+    #             _print_node(v, path=f"{path}.{k}", indent=indent + 2)
+
+    #     _print_node(self.root)
+
+    # Being used to print new insert function which tracks values
+    # Works well for entire dataguide. 
+    # def print_guide_values(self):
+    #     """
+    #     Prints the DataGuide structure along with tracked distinct values.
+    #     """
+    #     def _print_node(node, path="root"):
+    #         # Base counters
+    #         print(f"{path}: {node.counters}")
+
+    #         # Distinct value tracking
+    #         if hasattr(self, "_value_counters") and path in self._value_counters:
+    #             val_info = self._value_counters[path]
+    #             if val_info is None:
+    #                 print(f" [high-cardinality: >1000 unique values]")
+    #             elif len(val_info) > 0:
+    #                 top_values = sorted(val_info.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    #                 print(f" Distinct values (top 5 of {len(val_info)}): {top_values}")
+    #         elif hasattr(self, "_high_cardinality") and path in self._high_cardinality:
+    #             print(f" [high-cardinality detected]")
+
+    #         # Recurse
+    #         for key, child in node.children.items():
+    #             _print_node(child, f"{path}.{key}")
+
+    #     _print_node(self.root)
 
     def print_guide_values(self, max_values=5):
         """
-        Recursively prints the guide's counters and top distinct values.
+        Prints full DataGuide with _value_counters and _high_cardinality.
+        Nested DataGuides with node.value_summary.
+        Shows top distinct values up to `max_values`.
         """
 
         def _print_node(node, path="root", indent=0):
             prefix = " " * indent
             print(f"{prefix}{path}: {node.counters}")
 
+
             if hasattr(node, "value_summary"):
                 vs = node.value_summary
                 if "high_cardinality" in vs:
-                    print(f"{prefix}  [high-cardinality: >{max_values} unique values]")
+                    print(f"{prefix}  [high-cardinality: >1000 unique values]")
                 else:
                     top_vals = vs["top_values"][:max_values]
-                    print(f"{prefix}  Distinct values (top {len(top_vals)} of {vs['num_distinct']}): {top_vals}")
+                    print(
+                        f"{prefix}  Distinct values "
+                        f"(top {len(top_vals)} of {vs['num_distinct']}): {top_vals}"
+                    )
 
+            elif hasattr(self, "_value_counters") and path in self._value_counters:
+                val_info = self._value_counters[path]
+
+                if val_info is None:
+                    print(f"{prefix}  [high-cardinality: >1000 unique values]")
+                elif len(val_info) > 0:
+                    # Sort top values
+                    top = sorted(val_info.items(), key=lambda kv: kv[1], reverse=True)[:max_values]
+                    print(
+                        f"{prefix}  Distinct values (top {len(top)} of {len(val_info)}): {top}"
+                    )
+
+        
+            elif hasattr(self, "_high_cardinality") and path in self._high_cardinality:
+                print(f"{prefix}  [high-cardinality detected]")
+
+        
+            # Recurse into children
             for k, v in node.children.items():
                 _print_node(v, path=f"{path}.{k}", indent=indent + 2)
 
         _print_node(self.root)
+
+    from itertools import combinations
+
+    def find_cooccurring_paths(self, min_group_size=2):
+        """
+        Returns groups of paths that appear in exactly the same number of documents.
+        Only includes groups with at least min_group_size.
+        Results are sorted by document count and path name.
+        """
+        path_counts = {}
+
+        def _collect(node, path="root"):
+            # Total number of documents where this path appears
+            doc_count = sum(node.counters.values())
+            path_counts[path] = doc_count
+
+            for k, v in node.children.items():
+                _collect(v, f"{path}.{k}")
+
+        _collect(self.root)
+
+        # Group paths by identical document count
+        groups = {}
+        for path, count in path_counts.items():
+            groups.setdefault(count, []).append(path)
+
+        # Filter groups and sort internal lists
+        filtered = {
+            count: sorted(paths)
+            for count, paths in groups.items()
+            if len(paths) >= min_group_size
+        }
+
+        # Return as a sorted list of (count, [paths...]) tuples
+        return dict(sorted(filtered.items(), key=lambda x: x[0], reverse=True))
+
+
+    def show_distinct_to_path_matches(self, path=None, top_n=None, skip_empty=True):
+        """
+        Shows distinct values for a path (or all paths with distinct values) along with their
+        document counts and which other paths have the same document count.
+
+        Parameters:
+            path (str or None): The path to check distinct values for.
+            top_n (int or None): How many top distinct values to show per path.
+            skip_empty (bool): If True, skip values where the matching path list is empty.
+        """
+
+        # Build path -> doc_count mapping
+        def _collect_doc_counts(node, path="root"):
+            doc_count = sum(node.counters.values())
+            result = {path: doc_count}
+            for k, v in node.children.items():
+                result.update(_collect_doc_counts(v, f"{path}.{k}"))
+            return result
+
+        all_path_counts = _collect_doc_counts(self.root)
+
+        # Determine which paths to process
+        if path is None:
+            if not hasattr(self, "_value_counters"):
+                print("No distinct value tracking found in the dataguide.")
+                return
+            paths_to_process = list(self._value_counters.keys())
+        else:
+            paths_to_process = [path]
+
+        for pth in paths_to_process:
+
+            # Skip if _value_counters is None for this path
+            if not hasattr(self, "_value_counters") or pth not in self._value_counters:
+                continue
+            val_counts = self._value_counters[pth]
+            if val_counts is None:  # high-cardinality path
+                continue
+
+            # Traverse to the node
+            parts = pth.split(".")
+            node = self.root
+            for part in parts[1:]:  # skip 'root'
+                if part in node.children:
+                    node = node.children[part]
+                else:
+                    node = None
+                    break
+            if node is None:
+                continue
+
+            # Sort values
+            sorted_vals = sorted(val_counts.items(), key=lambda kv: kv[1], reverse=True)
+            if top_n:
+                sorted_vals = sorted_vals[:top_n]
+
+            print(f"\nDistinct values at '{pth}' with matching paths by document count:")
+
+            for val, val_count in sorted_vals:
+
+                matching_paths = [
+                    path for path, c in all_path_counts.items()
+                    if c == val_count
+                ]
+
+                # skip values that produce *no* matches
+                if skip_empty and not matching_paths:
+                    continue
+
+                print(f"  {val}: {val_count} -> {matching_paths}")
+
+
+
+    # Test function, might get deleted
+    def find_exact_sum_relationships(self, path=None, k=3, max_keys_for_combinatorics=200):
+        """
+        Find exact-sum relationships among distinct-value counts for `path`.
+        If `path` is None, run this analysis for *all* paths that have distinct-value counters.
+
+        Parameters:
+            path (str or None)
+            k (int): max arity (2..k)
+            max_keys_for_combinatorics (int)
+        """
+
+        # If path=None then run for all paths with value counters
+        if path is None:
+            if not hasattr(self, "_value_counters") or not self._value_counters:
+                print("No distinct-value counters available in this DataGuide.")
+                return []
+
+            all_results = []
+            for p in self._value_counters.keys():
+                sub = self.find_exact_sum_relationships(
+                    path=p,
+                    k=k,
+                    max_keys_for_combinatorics=max_keys_for_combinatorics
+                )
+                if sub:
+                    all_results.extend(sub)
+
+            return all_results
+
+        # normalize path candidates
+        candidates = [path]
+        if not path.startswith("root."):
+            candidates.append("root." + path)
+
+        counts_map = None
+        source_path_used = None
+
+        # Using insertion-based value counters
+        if hasattr(self, "_value_counters"):
+            for p in candidates:
+                vals = self._value_counters.get(p, None)
+                if isinstance(vals, dict):
+                    counts_map = {str(v): int(c) for v, c in vals.items()}
+                    source_path_used = p
+                    break
+                if vals is None and p in self._value_counters:
+                    print(f"Path {p} is marked high-cardinality; cannot compute exact-sum relationships for its values.")
+                    return []
+
+        # Fallback to node.value_summary top_values
+        if counts_map is None:
+            node = None
+            try:
+                path_obj = Path(path) if not isinstance(path, Path) else path
+                try:
+                    node = self._traverse_path(path_obj)
+                except Exception:
+                    node = None
+            except Exception:
+                node = None
+
+            if node is None:
+                for pstr, n in self._iter_paths_and_nodes():
+                    if pstr in candidates:
+                        node = n
+                        source_path_used = pstr
+                        break
+
+            if node is not None:
+                if hasattr(node, "value_summary") and node.value_summary:
+                    vs = node.value_summary
+                    if "top_values" in vs and isinstance(vs["top_values"], (list, tuple)):
+                        counts_map = {str(v): int(c) for v, c in vs["top_values"]}
+                        source_path_used = source_path_used or path
+                    else:
+                        print(f"Node for {path} has value_summary but no usable top_values.")
+                        return []
+                else:
+                    print(f"No distinct-value counters found for path candidates: {candidates}")
+                    return []
+
+        if not counts_map:
+            print(f"No values to analyze for {path}.")
+            return []
+
+        # Build candidate list
+        keys = list(counts_map.keys())
+        counts = counts_map
+
+        # Safe guard
+        if len(keys) > max_keys_for_combinatorics and k > 2:
+            print(f"Too many distinct values ({len(keys)}) to check combinations up to k={k}.")
+            print("Reduce k or set max_keys_for_combinatorics higher. Attempting only 2-way combos.")
+            k = 2
+
+        # Build other-path counts
+        other_path_counts = {}
+        for pstr, node in self._iter_paths_and_nodes():
+            if pstr == source_path_used:
+                continue
+            try:
+                if hasattr(self, "_doc_count_for_node"):
+                    pcnt = int(self._doc_count_for_node(node))
+                else:
+                    pcnt = int(sum(v for v in node.counters.values()))
+            except Exception:
+                pcnt = int(sum(v for v in node.counters.values()))
+            other_path_counts[pstr] = pcnt
+
+        results = []
+        printed_any = False
+
+        print(f"\n Searching exact-sum relationships for path (using {source_path_used}):")
+        print(f"Found {len(keys)} distinct tracked values (showing up to first 50):")
+        print(", ".join(f"{k}({counts[k]})" for k in keys[:50]) + ("\n" if len(keys) > 50 else "\n\n"))
+
+        max_r = max(2, min(k, len(keys)))
+        for r in range(2, max_r + 1):
+            found_this_r = False
+            print(f"--- Checking {r}-way combinations ---")
+            for combo in combinations(keys, r):
+                combo_sum = sum(counts[c] for c in combo)
+
+                # # 1) internal matches # remving same paths, might not need
+                # for target_val, target_count in counts.items():
+                #     if target_val in combo:
+                #         continue
+                #     if target_count == combo_sum:
+                #         found_this_r = True
+                #         printed_any = True
+                #         results.append({
+                #             "type": "intra_path_value_match",
+                #             "combo_values": combo,
+                #             "target_value": target_val,
+                #             "sum": combo_sum,
+                #             "source_path": source_path_used
+                #         })
+                #         combo_str = " + ".join(f"{c}({counts[c]})" for c in combo)
+                #         print(f" {combo_str} = {target_val}({target_count})  [same path]")
+
+                # 2) cross-path matches
+                for other_path, other_cnt in other_path_counts.items():
+                    if other_cnt == combo_sum:
+                        found_this_r = True
+                        printed_any = True
+                        results.append({
+                            "type": "cross_path_match",
+                            "combo_values": combo,
+                            "target_path": other_path,
+                            "sum": combo_sum,
+                            "source_path": source_path_used
+                        })
+                        combo_str = " + ".join(f"{c}({counts[c]})" for c in combo)
+                        print(f" {combo_str} = {other_path}({other_cnt})  [cross-path match]")
+
+            if not found_this_r:
+                print(" (no matches for this arity)\n")
+            else:
+                print()
+
+        if not printed_any:
+            print("No exact-sum relationships found.")
+        else:
+            print(f"Found {len(results)} exact-sum relationship(s).\n")
+
+        return results
 
     
     def list_paths_with_counts(self, include_values=False, max_values=5):
@@ -870,7 +1238,7 @@ class DataGuidePath:
         Supports:
         - grouping_paths: list of paths to keep at root (like 'deptid')
         - nest_specs: list of (newpath, list(path)) pairs (list(path) may be empty)
-            → These define nested arrays where each entry contains those paths
+             These define nested arrays where each entry contains those paths
         - new_path_for_others: fallback for legacy usage (e.g., group-and-nest-everything-else)
         """
         if not grouping_paths and not nest_specs:
@@ -898,7 +1266,7 @@ class DataGuidePath:
 
                 guides.append(self._nest_struct_into_array(newpath, included_paths))
 
-        # 3. Handle aggregation-only case (argument 2)
+        # 3. Handle aggregation-only
         if aggregations:
             guides.append(self._apply_aggregations(aggregations))
 
@@ -914,7 +1282,6 @@ class DataGuidePath:
         max_docs_est, min_docs_est = self._estimate_doc_impact_bounds(grouping_paths, aggregations)
         result.max_docs_est = max_docs_est
         result.min_docs_est = min_docs_est
-
 
         return result
     
